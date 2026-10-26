@@ -313,26 +313,22 @@ jobs:
           mkdir -p reports/unit-tests reports/coverage
           rc=0
           python -m pip install --quiet "frappe-bench==5.31.0" "coverage~=7.6" "unittest-xml-reporting~=3.2" || rc=$?
-          [ "$rc" != 0 ] || bench init --frappe-branch "$FRAPPE_BRANCH" --skip-redis-config-generation \
+          # bench resolves its bench directory from the working directory.
+          b() { ( cd "$BENCH_DIR" && bench "$@" ); }
+          [ "$rc" != 0 ] || b init --frappe-branch "$FRAPPE_BRANCH" --skip-redis-config-generation \
             --skip-assets --python python3.11 "$BENCH_DIR" || rc=$?
-          [ "$rc" != 0 ] || bench --site test_site new-site test_site \
+          [ "$rc" != 0 ] || b get-app "$GITHUB_WORKSPACE" || rc=$?
+          [ "$rc" != 0 ] || b new-site test_site \
             --db-host "$DB_HOST" --db-port "$DB_PORT" \
             --mariadb-root-username root --mariadb-root-password "$DB_ROOT_PASSWORD" \
-            --admin-password "$ADMIN_PASSWORD" --no-mariadb-socket \
-            --force --verbose 2>&1 | tail -5 || true
-          [ "$rc" != 0 ] || bench get-app "$GITHUB_WORKSPACE" --skip-assets || rc=$?
-          [ "$rc" != 0 ] || bench --site test_site install-app frappe_gates_demo || rc=$?
-          [ "$rc" != 0 ] || python - <<'PY' || rc=$?
-          import json, pathlib
-          p = pathlib.Path("sites/common_site_config.json")
-          cfg = json.loads(p.read_text())
-          cfg.update({"redis_cache": "redis://127.0.0.1:6379/0",
-                      "redis_queue": "redis://127.0.0.1:6379/1",
-                      "redis_socketio": "redis://127.0.0.1:6379/2",
-                      "allow_tests": True})
-          p.write_text(json.dumps(cfg, indent=1))
-          PY
-          [ "$rc" != 0 ] || bench setup requirements --dev || rc=$?
+            --admin-password "$ADMIN_PASSWORD" --no-mariadb-socket || rc=$?
+          [ "$rc" != 0 ] || b --site test_site install-app frappe_gates_demo || rc=$?
+          # The test runner needs a cache/queue and `allow_tests` on the site.
+          [ "$rc" != 0 ] || b set-config -g redis_cache redis://127.0.0.1:6379/0 || rc=$?
+          [ "$rc" != 0 ] || b set-config -g redis_queue redis://127.0.0.1:6379/1 || rc=$?
+          [ "$rc" != 0 ] || b set-config -g redis_socketio redis://127.0.0.1:6379/2 || rc=$?
+          [ "$rc" != 0 ] || b set-config -g allow_tests 1 || rc=$?
+          [ "$rc" != 0 ] || b setup requirements --dev || rc=$?
           # Coverage is measured around the FRAMEWORK's own runner, from
           # sites/ (that is where bench executes frappe commands), so the
           # number covers the app's code paths a test actually exercises.
@@ -340,7 +336,7 @@ jobs:
             --rcfile="$GITHUB_WORKSPACE/.coveragerc" \
             -m frappe.utils.bench_helper frappe --site test_site run-tests \
             --app frappe_gates_demo --junit-xml-output "$GITHUB_WORKSPACE/reports/unit-tests/junit.xml" ) || rc=$?
-          [ "$rc" != 0 ] || ( cd "$BENCH_DIR/sites" && ../env/bin/coverage xml -o "$GITHUB_WORKSPACE/reports/coverage/coverage.xml" -q ) || rc=$?
+          [ "$rc" != 0 ] || ( cd "$BENCH_DIR/sites" && ../env/bin/coverage xml --rcfile="$GITHUB_WORKSPACE/.coveragerc" -o "$GITHUB_WORKSPACE/reports/coverage/coverage.xml" -q ) || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           exit 0
       - id: tests

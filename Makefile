@@ -29,8 +29,8 @@ coverage:
 	mkdir -p reports/coverage
 	cd $(BENCH)/sites && ../env/bin/coverage run --rcfile=$(CURDIR)/.coveragerc \
 		-m frappe.utils.bench_helper frappe --site $(SITE) run-tests --app frappe_gates_demo
-	cd $(BENCH)/sites && ../env/bin/coverage xml -o $(CURDIR)/reports/coverage/coverage.xml -q
-	cd $(BENCH)/sites && ../env/bin/coverage report
+	cd $(BENCH)/sites && ../env/bin/coverage xml --rcfile=$(CURDIR)/.coveragerc -o $(CURDIR)/reports/coverage/coverage.xml -q
+	cd $(BENCH)/sites && ../env/bin/coverage report --rcfile=$(CURDIR)/.coveragerc
 
 image:
 	docker build --provenance=false --sbom=false -t frappe-gates-demo:local .

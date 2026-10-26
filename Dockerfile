@@ -26,6 +26,7 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
       ca-certificates curl git xz-utils gnupg build-essential libffi-dev pkg-config \
+      cron procps \
  && curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
  && apt-get install -y -qq --no-install-recommends nodejs \
  && npm install -g --silent "yarn@1.22.22" \
@@ -61,6 +62,13 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/home/frappe/frappe-bench/env/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 COPY --from=bench --chown=10001:10001 /home/frappe/frappe-bench /home/frappe/frappe-bench
+# bench and its resolver live in the BUILD stage's system Python. Copying the
+# installed tree is byte-for-byte what that stage installed — re-running pip in
+# the runtime stage would resolve again, and a pip index that moved between the
+# two reproducible-build passes would break digest equality.
+COPY --from=bench /usr/local/lib/python3.11/site-packages/ /usr/local/lib/python3.11/site-packages/
+COPY --from=bench /usr/local/bin/bench /usr/local/bin/bench
+COPY --from=bench /usr/local/bin/uv /usr/local/bin/uv
 COPY --chown=10001:10001 . /home/frappe/frappe-bench/apps/frappe_gates_demo
 
 WORKDIR /home/frappe/frappe-bench

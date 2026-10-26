@@ -8,7 +8,7 @@ branch = False
 [report]
 omit =
     */tests/*
-    */test_*.py
+    */doctype/*/test_*.py
     */__init__.py
     */patches/*
     */templates/*
