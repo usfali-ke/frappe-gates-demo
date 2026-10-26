@@ -24,6 +24,15 @@ fi
 
 cd "$BENCH_DIR"
 
+# A fresh volume mounted at sites/ is empty: restore the parts that ship with
+# the image (built assets, assets.json, apps.txt, the site-wide config) before
+# anything else runs. -n: never overwrite what the volume already holds.
+if [ ! -f sites/assets/assets.json ] && [ -d /opt/sites-template ]; then
+	echo "entrypoint: seeding sites/ from the image template"
+	mkdir -p sites
+	cp -an /opt/sites-template/. sites/
+fi
+
 # Redis and the site's switches come from the environment, never from a write
 # to sites/common_site_config.json: the image keeps that file read-only (the
 # root filesystem is read-only in the cluster), and Frappe reads the
@@ -78,6 +87,11 @@ PY
 		echo "entrypoint: restore the site volume or drop the database — the pair cannot be rebuilt separately" >&2
 		exit 1
 	fi
+	# A volume mounted at the site path makes Docker/Kubernetes create the
+	# directory itself; Frappe's new-site refuses an existing directory even
+	# when it is empty. rmdir (not rm -rf) keeps this safe: a directory that
+	# holds anything at all stays put.
+	rmdir "sites/${SITE_NAME}" 2>/dev/null || true
 	echo "entrypoint: creating site ${SITE_NAME}"
 	# --no-mariadb-socket: pymysql over TCP, so the image needs no socket path.
 	bench new-site "$SITE_NAME" \

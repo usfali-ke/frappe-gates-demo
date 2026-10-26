@@ -89,10 +89,15 @@ WORKDIR /home/frappe/frappe-bench
 # The app is registered the way `bench get-app` would (apps.txt + import path)
 # without running pip: the app has no dependencies, and a pip call here would
 # pull live index metadata into the layer and break reproducibility.
+# The site directory is the writable volume, and a volume mounted at sites/
+# HIDES this tree — including the built assets and apps.txt. Keep a pristine
+# copy outside sites/ so the entrypoint can restore it into a fresh volume.
 RUN printf 'frappe\nfrappe_gates_demo\n' > sites/apps.txt \
  && printf '/home/frappe/frappe-bench/apps/frappe\n/home/frappe/frappe-bench/apps/frappe_gates_demo\n' \
       > env/lib/python3.11/site-packages/frappe_apps.pth \
- && mkdir -p sites/assets logs
+ && mkdir -p sites/assets logs \
+ && cp -a sites /opt/sites-template \
+ && chown -R 10001:10001 /opt/sites-template
 
 COPY --chown=10001:10001 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chown=10001:10001 docker/wsgi.py /home/frappe/frappe-bench/wsgi_site.py

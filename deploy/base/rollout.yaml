@@ -95,12 +95,12 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            # Only the SITE's directory is writable. sites/ itself stays
-            # read-only image content: it carries the built assets and
-            # assets.json the login page and desk render from, and mounting a
-            # volume over it would hide them.
+            # The site volume is mounted over sites/, which hides the built
+            # assets the image carries there; the entrypoint restores them
+            # from /opt/sites-template on first start (cp -n, so a populated
+            # volume is never overwritten).
             - name: sites
-              mountPath: /home/frappe/frappe-bench/sites/frappe-gates-demo.local
+              mountPath: /home/frappe/frappe-bench/sites
             - name: logs
               mountPath: /home/frappe/frappe-bench/logs
             - name: tmp
