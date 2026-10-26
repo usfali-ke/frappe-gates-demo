@@ -82,18 +82,17 @@ jobs:
           for tag in dep-mariadb-10.11 dep-redis-7-alpine; do
             ref="${DEST}:${tag}"
             digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" | cut -d@ -f2)
-            # Read the image from the registry, not the daemon: syft's container
-            # runs as uid 65532 and cannot open the root-owned socket ("docker
-            # not available: failed to connect to Docker daemon"), which is what
-            # made this step exit 1 with only pull progress in the log.
+            # Scan a file, the way the main pipeline does (it hands syft an
+            # oci-archive). syft's container cannot open the root-owned docker
+            # socket and its registry source answered with an unhelpful exit 1;
+            # `docker save` needs neither.
+            docker save "${ref}" -o "$RUNNER_TEMP/mirror/${tag}.tar"
             docker run --rm \
-              -e SYFT_CHECK_FOR_APP_UPDATE=false \
-              -e SYFT_REGISTRY_AUTH_AUTHORITY=ghcr.io \
-              -e SYFT_REGISTRY_AUTH_USERNAME="${GITHUB_ACTOR}" \
-              -e SYFT_REGISTRY_AUTH_PASSWORD="${GHCR_TOKEN}" \
-              -v "$RUNNER_TEMP/mirror:/out" \
-              ghcr.io/anchore/syft:v1.27.0 "registry:${ref}" \
-              -o cyclonedx-json="/out/${tag}.cdx.json" -q
+              -v "$RUNNER_TEMP/mirror:/in:ro" \
+              ghcr.io/anchore/syft:v1.52.0 \
+              "docker-archive:/in/${tag}.tar" \
+              -q -o cyclonedx-json="/in/${tag}.cdx.json"
+            rm -f "$RUNNER_TEMP/mirror/${tag}.tar"
             cat > "$RUNNER_TEMP/mirror/${tag}.slsa.json" <<JSON
           {
             "_type": "https://in-toto.io/Statement/v1",
