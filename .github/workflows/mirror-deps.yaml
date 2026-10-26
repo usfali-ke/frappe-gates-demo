@@ -66,19 +66,25 @@ jobs:
           cosign-release: v2.6.5
 
       - name: SBOM (syft) and SLSA v1 provenance for the mirrored digests
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/mirror"
           for tag in dep-mariadb-10.11 dep-redis-7-alpine; do
             ref="${DEST}:${tag}"
             digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" | cut -d@ -f2)
-            # syft reads the image through the local daemon (the copy just pulled
-            # it), so the socket has to be mounted: without it syft exits 1 with
-            # no message beyond the pull progress.
-            docker run --rm -e SYFT_CHECK_FOR_APP_UPDATE=false \
-              -v /var/run/docker.sock:/var/run/docker.sock \
+            # Read the image from the registry, not the daemon: syft's container
+            # runs as uid 65532 and cannot open the root-owned socket ("docker
+            # not available: failed to connect to Docker daemon"), which is what
+            # made this step exit 1 with only pull progress in the log.
+            docker run --rm \
+              -e SYFT_CHECK_FOR_APP_UPDATE=false \
+              -e SYFT_REGISTRY_AUTH_AUTHORITY=ghcr.io \
+              -e SYFT_REGISTRY_AUTH_USERNAME="${GITHUB_ACTOR}" \
+              -e SYFT_REGISTRY_AUTH_PASSWORD="${GHCR_TOKEN}" \
               -v "$RUNNER_TEMP/mirror:/out" \
-              ghcr.io/anchore/syft:v1.27.0 "docker:${ref}" \
+              ghcr.io/anchore/syft:v1.27.0 "registry:${ref}" \
               -o cyclonedx-json="/out/${tag}.cdx.json" -q
             cat > "$RUNNER_TEMP/mirror/${tag}.slsa.json" <<JSON
           {
