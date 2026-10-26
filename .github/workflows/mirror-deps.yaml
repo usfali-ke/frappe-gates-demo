@@ -18,10 +18,15 @@ on:
 permissions:
   contents: read
   packages: write
-  # Keyless signing: the mirrored images must satisfy the same G6 policy as the
-  # app image (signature + CycloneDX SBOM + SLSA provenance, keyless identity
-  # restricted to this repository's workflows), otherwise Argo's sync is denied
-  # by verify-image-signatures and the dependency pods never start.
+  # Keyless signing needs the Actions OIDC token. Without this line cosign falls
+  # back to the interactive device flow and the run dies with
+  # "retrieving cert: error obtaining token: expired_token" — the comment below
+  # was there but the permission was not.
+  id-token: write
+  # The mirrored images must satisfy the same G6 policy as the app image
+  # (signature + CycloneDX SBOM + SLSA provenance, keyless identity restricted to
+  # this repository's workflows), otherwise Argo's sync is denied by
+  # verify-image-signatures and the dependency pods never start.
 
 env:
   # Digest only: skopeo refuses "tag@digest" ("Docker references with both a tag
