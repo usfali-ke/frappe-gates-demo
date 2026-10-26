@@ -87,11 +87,14 @@ jobs:
             # socket and its registry source answered with an unhelpful exit 1;
             # `docker save` needs neither.
             docker save "${ref}" -o "$RUNNER_TEMP/mirror/${tag}.tar"
+            # One writable mount: the previous attempt mounted it :ro and asked
+            # syft to write the SBOM into it, which is the exit-1-with-no-message
+            # that cost four runs.
             docker run --rm \
-              -v "$RUNNER_TEMP/mirror:/in:ro" \
+              -v "$RUNNER_TEMP/mirror:/data" \
               ghcr.io/anchore/syft:v1.52.0 \
-              "docker-archive:/in/${tag}.tar" \
-              -q -o cyclonedx-json="/in/${tag}.cdx.json"
+              "docker-archive:/data/${tag}.tar" \
+              -q -o cyclonedx-json="/data/${tag}.cdx.json"
             rm -f "$RUNNER_TEMP/mirror/${tag}.tar"
             cat > "$RUNNER_TEMP/mirror/${tag}.slsa.json" <<JSON
           {
