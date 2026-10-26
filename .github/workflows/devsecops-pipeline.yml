@@ -417,49 +417,49 @@ jobs:
           path: reports/reviewers/
           if-no-files-found: ignore
 
-  ai-review:
-    name: Develop · AI security review · Hermes
-    if: startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
-    # The Hermes gateway is the LAB one (192.168.122.191:8644, kali-vm on the
-    # libvirt bridge), which is reachable from the host runners and not from an
-    # in-cluster ARC pod: the sender must run where the route is routable.
-    runs-on: [self-hosted, linux, frappe-gates-demo-env]
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      CONTROL: ai-review
-      OUT: reports/ai-review
-      VERDICT_FILE: reports/ai-review/verdict.json
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          sparse-checkout: .github/scripts
-      - id: verdict
-        env:
-          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL || 'http://192.168.122.191:8644/webhooks/github-pr-review' }}
-          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
-          HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          WAIT_SECONDS: "1500"
-        run: python3 .github/scripts/hermes_review.py
-      # Supplementary evidence only — the verdict reaches gate-g1 through the
-      # job output. lab-runner's egress to GitHub's artifact storage is
-      # flaky (ETIMEDOUT), and that must not turn a passing review red.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        continue-on-error: true
-        with:
-          name: report-ai-review
-          path: reports/ai-review/
-          if-no-files-found: ignore
+  # ai-review:
+  #   name: Develop · AI security review · Hermes
+  #   if: startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
+  #   # The Hermes gateway is the LAB one (192.168.122.191:8644, kali-vm on the
+  #   # libvirt bridge), which is reachable from the host runners and not from an
+  #   # in-cluster ARC pod: the sender must run where the route is routable.
+  #   runs-on: [self-hosted, linux, frappe-gates-demo-env]
+  #   timeout-minutes: 30
+  #   permissions:
+  #     contents: read
+  #     pull-requests: read
+  #     issues: read
+  #   outputs:
+  #     result: ${{ steps.verdict.outputs.result }}
+  #   env:
+  #     CONTROL: ai-review
+  #     OUT: reports/ai-review
+  #     VERDICT_FILE: reports/ai-review/verdict.json
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  #       with:
+  #         persist-credentials: false
+  #         sparse-checkout: .github/scripts
+  #     - id: verdict
+  #       env:
+  #         HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL || 'http://192.168.122.191:8644/webhooks/github-pr-review' }}
+  #         HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+  #         HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
+  #         GH_TOKEN: ${{ github.token }}
+  #         PR_NUMBER: ${{ github.event.pull_request.number }}
+  #         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  #         WAIT_SECONDS: "1500"
+  #       run: python3 .github/scripts/hermes_review.py
+  #     # Supplementary evidence only — the verdict reaches gate-g1 through the
+  #     # job output. lab-runner's egress to GitHub's artifact storage is
+  #     # flaky (ETIMEDOUT), and that must not turn a passing review red.
+  #     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+  #       if: always()
+  #       continue-on-error: true
+  #       with:
+  #         name: report-ai-review
+  #         path: reports/ai-review/
+  #         if-no-files-found: ignore
 
   commits-signed:
     name: Develop · governance · signed commits
