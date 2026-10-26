@@ -40,7 +40,6 @@ WORKDIR /home/frappe
 RUN bench init \
       --frappe-branch "${FRAPPE_VERSION}" \
       --skip-redis-config-generation \
-      --skip-assets \
       --python python3.11 \
       frappe-bench \
  && find /home/frappe/frappe-bench/apps -name .git -prune -exec rm -rf {} + \
@@ -53,12 +52,27 @@ FROM python:3.11-slim@sha256:b95327ce1439e687237841b0210677aeadd62d55a060a5f6bcb
 # bench CLI shells out to the mariadb client for a few administrative paths.
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
-      ca-certificates mariadb-client \
+      ca-certificates git mariadb-client \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt /var/log/apt /var/log/dpkg.log /var/log/alternatives.log /var/log/apt-history.log
+# Frappe bootstraps a new site by piping a schema dump through the mariadb
+# CLI. Debian's client requires TLS by default while the lab MariaDB serves
+# plain TCP in-cluster, so the bootstrap fails with "SSL is required, but the
+# server does not support it". A real deployment keeps the TLS default and
+# provisions certificates; this is a lab-wide exception, scoped to the client.
+RUN printf '[client]\nskip-ssl\n' > /etc/mysql/mariadb.conf.d/99-lab-no-tls.cnf
+
+# The runtime user must EXIST, not just have an id: bench's own config loading
+# calls getpass.getuser(), which resolves uid 10001 through /etc/passwd and
+# raises KeyError without this entry. HOME is the bench parent, as in a real
+# bench install; it stays unwritable for the app (HOME=/tmp in the rollout).
+RUN groupadd -r -g 10001 frappe \
+ && useradd -r -u 10001 -g 10001 -M -d /home/frappe -s /usr/sbin/nologin frappe \
+ && mkdir -p /home/frappe/frappe-bench
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/home/frappe \
+    PYTHONPATH=/home/frappe/frappe-bench \
     PATH="/home/frappe/frappe-bench/env/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 COPY --from=bench --chown=10001:10001 /home/frappe/frappe-bench /home/frappe/frappe-bench
@@ -76,11 +90,12 @@ WORKDIR /home/frappe/frappe-bench
 # without running pip: the app has no dependencies, and a pip call here would
 # pull live index metadata into the layer and break reproducibility.
 RUN printf 'frappe\nfrappe_gates_demo\n' > sites/apps.txt \
- && printf '[home/frappe/frappe-bench/apps/frappe_gates_demo]\n' > env/lib/python3.11/site-packages/frappe_gates_demo.pth \
- && printf '[home/frappe/frappe-bench/apps/frappe]\n' > env/lib/python3.11/site-packages/frappe.pth \
+ && printf '/home/frappe/frappe-bench/apps/frappe\n/home/frappe/frappe-bench/apps/frappe_gates_demo\n' \
+      > env/lib/python3.11/site-packages/frappe_apps.pth \
  && mkdir -p sites/assets logs
 
 COPY --chown=10001:10001 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chown=10001:10001 docker/wsgi.py /home/frappe/frappe-bench/wsgi_site.py
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 # Numeric, so runAsNonRoot verifies it without an /etc/passwd entry.
@@ -95,4 +110,4 @@ CMD ["gunicorn", \
      "--bind=0.0.0.0:8000", \
      "--threads=4", "--workers=2", "--worker-class=gthread", \
      "--worker-tmp-dir=/dev/shm", "--timeout=120", "--preload", \
-     "frappe.app:application"]
+     "wsgi_site:application"]

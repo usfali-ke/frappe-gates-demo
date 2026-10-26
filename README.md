@@ -19,10 +19,12 @@ a real rollout, and evidence that reaches the security dashboard.
 | `frappe_gates_demo.api.notes_list`, `notes_stats`, `note_create`, `note_close`, `whoami` | the whitelisted API: permission-scoped through `frappe.get_list`, session-owned writes, validation refusals (417) and permission refusals (403). |
 | `/notes` | a server-rendered page (the app's human surface): the list, the counts, the create form. |
 | `frappe_gates_demo.install.after_install` | seeds one note, idempotently — an install hook the migration control actually exercises. |
-| `frappe_gates_demo.test_support.ensure_user_from_env` | creates the two throwaway accounts the release's authenticated security suite needs; the password arrives on stdin and is read from `ENSURE_USER_PASSWORD`, never from argv. |
+| `frappe_gates_demo.test_support.ensure_user` | creates the two throwaway accounts the release's authenticated security suite needs (library, unit-tested). |
+| `python -m frappe_gates_demo.ensure_user <email>` | the CLI the release runs inside the pod: the password arrives on stdin, is exported as `ENSURE_USER_PASSWORD` and read from the environment, never from argv. |
 
-26 unit tests (Frappe's own runner, real MariaDB) and 35 live tests (HTTP
-against the deployed digest) cover it.
+31 unit tests (Frappe's own runner, real MariaDB; 95% line coverage of the
+app's own code) and 35 live tests (HTTP against the built image) cover it.
+Both were run against the real artifact, not a stand-in.
 
 ## Layout
 
@@ -130,11 +132,51 @@ Before the first pipeline run the product therefore reads as *awaiting
 evidence*. That is the honest state: nothing about this app has been built,
 scanned, signed or deployed yet.
 
+## Running the image (verified)
+
+```bash
+docker build -t frappe-gates-demo:local .
+docker run -d --network fgd-net \
+  -e DB_HOST=... -e DB_ROOT_PASSWORD=... -e SITE_NAME=frappe-gates-demo.local \
+  -e REDIS_CACHE_URL=redis://.../0 -e REDIS_QUEUE_URL=redis://.../1 \
+  frappe-gates-demo:local
+curl localhost:8000/api/method/frappe_gates_demo.api.health   # {"status":"ok",...}
+curl -o /dev/null -w '%{http_code}' localhost:8000/login       # 200
+```
+
+What the entrypoint does on first start, and why each step is there:
+
+* waits for MariaDB, then `bench new-site --install-app` — the site is created
+  *inside the container's copy of the bench*, not in a separate init job;
+* writes the Redis URLs into the **site's** `site_config.json` (the site
+  directory is the volume; the image-wide config stays read-only);
+* creates `migrate` runs on every start, so a new image rolls the schema;
+* `docker/wsgi.py` pins the site for gunicorn: Frappe otherwise resolves the
+  site from the `Host` header and 404s for a pod IP or a Service DNS name.
+
+Operational notes that cost real time here, worth keeping:
+
+* **The site directory and the database are a pair.** `site_config.json` holds
+  the site's DB credentials; an empty volume beside a live database cannot be
+  recovered. The entrypoint refuses that state with an explicit message
+  instead of Frappe's "Database ... already exists".
+* **Frappe bootstraps a new site through the `mariadb` CLI.** Debian's client
+  requires TLS by default, so the image ships a `[client] skip-ssl` drop-in
+  (`/etc/mysql/mariadb.conf.d/99-lab-no-tls.cnf`). A real deployment keeps the
+  default and provisions certificates.
+* **`bench init` needs `crontab` and the runtime needs `git`**: bench's own
+  config loading imports GitPython, and `getpass.getuser()` needs the runtime
+  user in `/etc/passwd` (it is created with id 10001, the id the pod runs as).
+* **Assets must be built** (`bench build`, which `bench init` runs): without
+  `sites/assets/assets.json` the website pages and the desk render as 500s.
+  `sites/` therefore stays image content — only `sites/<site>` is a volume.
+
 ## Not done yet (deliberately)
 
 * No GitHub repository, no pipeline run, no cluster namespaces/Argo
   Applications: creating them is an infrastructure change that needs a
   decision, not a side effect of scaffolding.
-* Desk assets are not built in the image (`bench init --skip-assets`): the
-  demo's surfaces are the API and `/notes`. Run `bench build` locally if you
-  want the styled desk.
+* The rollout's read-only root filesystem was not exercised in this session
+  (Docker could not give the mounted volumes the pod's uid). The mounts it
+  needs — `sites/<site>`, `logs`, `/tmp` — are defined in
+  `deploy/base/rollout.yaml`.

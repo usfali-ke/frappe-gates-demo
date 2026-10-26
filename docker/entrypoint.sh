@@ -24,11 +24,13 @@ fi
 
 cd "$BENCH_DIR"
 
-# Redis: one instance, three logical databases (cache / queue / socketio).
-bench set-config -g redis_cache "${REDIS_CACHE_URL:-redis://redis:6379/0}" >/dev/null
-bench set-config -g redis_queue "${REDIS_QUEUE_URL:-redis://redis:6379/1}" >/dev/null
-bench set-config -g redis_socketio "${REDIS_SOCKETIO_URL:-redis://redis:6379/2}" >/dev/null
-bench set-config -g developer_mode 0 >/dev/null
+# Redis and the site's switches come from the environment, never from a write
+# to sites/common_site_config.json: the image keeps that file read-only (the
+# root filesystem is read-only in the cluster), and Frappe reads the
+# FRAPPE_REDIS_* variables in preference to the config file.
+export FRAPPE_REDIS_CACHE="${REDIS_CACHE_URL:-redis://redis:6379/0}"
+export FRAPPE_REDIS_QUEUE="${REDIS_QUEUE_URL:-redis://redis:6379/1}"
+export FRAPPE_REDIS_SOCKETIO="${REDIS_SOCKETIO_URL:-redis://redis:6379/2}"
 
 echo "entrypoint: waiting for ${DB_HOST}:${DB_PORT}"
 python - "$DB_HOST" "$DB_PORT" "$DB_ROOT_USER" "$DB_ROOT_PASSWORD" <<'PY'
@@ -50,17 +52,41 @@ while True:
         time.sleep(2)
 PY
 
-if [ ! -d "sites/${SITE_NAME}" ]; then
+# The site directory and the database are a PAIR: site_config.json is the only
+# place the site's database credentials live. An empty volume beside a live
+# database cannot be recovered by guessing, so say so plainly instead of
+# letting Frappe fail with "Database ... already exists".
+if [ ! -f "sites/${SITE_NAME}/site_config.json" ]; then
+	if python - "$SITE_NAME" "$DB_HOST" "$DB_PORT" "$DB_ROOT_USER" "$DB_ROOT_PASSWORD" <<'PY'
+import re
+import sys
+
+import pymysql
+
+site, host, port, user, password = sys.argv[1:6]
+db = re.sub(r"[^0-9a-zA-Z]+", "_", site).lower()
+try:
+    conn = pymysql.connect(host=host, port=int(port), user=user, password=password, connect_timeout=5)
+except Exception:
+    raise SystemExit(0)
+with conn.cursor() as cur:
+    cur.execute("SHOW DATABASES LIKE %s", (db,))
+    raise SystemExit(0 if cur.fetchone() else 1)
+PY
+	then
+		echo "entrypoint: ${SITE_NAME} has no site_config.json but database '$SITE_NAME' exists;" >&2
+		echo "entrypoint: restore the site volume or drop the database — the pair cannot be rebuilt separately" >&2
+		exit 1
+	fi
 	echo "entrypoint: creating site ${SITE_NAME}"
 	# --no-mariadb-socket: pymysql over TCP, so the image needs no socket path.
 	bench new-site "$SITE_NAME" \
 		--db-host "$DB_HOST" --db-port "$DB_PORT" \
 		--mariadb-root-username "$DB_ROOT_USER" \
 		--mariadb-root-password "$DB_ROOT_PASSWORD" \
+		--mariadb-user-host-login-scope='%' \
 		--admin-password "$ADMIN_PASSWORD" \
-		--no-mariadb-socket \
-		--install-app "$APP" \
-		--set-default
+		--install-app "$APP"
 else
 	if ! bench --site "$SITE_NAME" list-apps | grep -qx "$APP"; then
 		echo "entrypoint: installing ${APP} on ${SITE_NAME}"
@@ -68,6 +94,13 @@ else
 	fi
 	bench --site "$SITE_NAME" migrate
 fi
+
+# Redis lives in the SITE's config (writable), not in the image-wide one: the
+# site directory is the volume, and everything that reads the site config —
+# the web workers, `bench` commands, the test-support CLI — must agree.
+bench --site "$SITE_NAME" set-config redis_cache "${REDIS_CACHE_URL:-redis://redis:6379/0}" >/dev/null
+bench --site "$SITE_NAME" set-config redis_queue "${REDIS_QUEUE_URL:-redis://redis:6379/1}" >/dev/null
+bench --site "$SITE_NAME" set-config redis_socketio "${REDIS_SOCKETIO_URL:-redis://redis:6379/2}" >/dev/null
 
 echo "entrypoint: starting: $*"
 exec "$@"
