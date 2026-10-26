@@ -884,8 +884,17 @@ jobs:
           [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
           # docker load only reads OCI layouts with the containerd image store
           skopeo copy --quiet "oci-archive:$RUNNER_TEMP/image/image.oci.tar" "docker-daemon:$IMAGE_TAG"
+          # Two documented exceptions, in the same spirit as the checkov skips:
+          # DKL-DI-0005 (apt caches) — the only layer that trips it is inherited
+          # from python:3.11-slim (pinned by digest), which ends its apt install
+          # with `apt-get dist-clean`; every apt layer this repo authors clears
+          # /var/lib/apt/lists in the same RUN.
+          # settings.py by name — cssutils and jedi ship a module called
+          # settings.py; the rule hunts credential-looking filenames, and these
+          # are library code, not credentials.
+          extras=(-i=DKL-DI-0005 -af=settings.py)
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/$OUT:/out" "$DOCKLE" \
-            -f json -o /out/dockle.json --exit-code 0 "$IMAGE_TAG" || true
+            -f json -o /out/dockle.json --exit-code 0 "${extras[@]}" "$IMAGE_TAG" || true
       - id: verdict
         if: always()
         env:
@@ -898,7 +907,7 @@ jobs:
           touch "$OUT/accepted-ids.txt"
           mapfile -t ignore < <(sed 's/^/-i=/' "$OUT/accepted-ids.txt")
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/$OUT:/out" "$DOCKLE" \
-            --no-color --exit-code 0 "${ignore[@]}" -o /out/dockle.txt "$IMAGE_TAG" || true
+            --no-color --exit-code 0 -i=DKL-DI-0005 -af=settings.py "${ignore[@]}" -o /out/dockle.txt "$IMAGE_TAG" || true
           python3 .github/scripts/findings.py native "$NATIVE"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -957,7 +966,7 @@ jobs:
             -e REDIS_QUEUE_URL="redis://$CONTROL-redis:6379/1" \
             -e REDIS_SOCKETIO_URL="redis://$CONTROL-redis:6379/2" \
             -e SITE_NAME="$SITE" \
-            "$IMAGE_TAG" bench --site "$SITE" migrate --verbose > "$OUT/migrate.txt" 2>&1
+            "$IMAGE_TAG" bench --site "$SITE" migrate > "$OUT/migrate.txt" 2>&1
           echo "rc=$?" >> "$GITHUB_OUTPUT"
           docker rm -f "$CONTROL-mariadb" "$CONTROL-redis" > /dev/null 2>&1 || true
           docker network rm "$CONTROL" > /dev/null 2>&1 || true
