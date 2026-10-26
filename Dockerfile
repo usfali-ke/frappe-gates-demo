@@ -10,7 +10,7 @@
 # digests (measured on the first pipeline run). With a fixed base, the only
 # inputs here are this repository's source and two files the build writes,
 # both deterministic.
-FROM ghcr.io/usfali-ke/frappe-gates-demo-bench:v15-15.123.1@sha256:db02a41c1737eb8ba153837f3641293f5d9b81916f651d26e2ecf42337965122
+FROM ghcr.io/usfali-ke/frappe-gates-demo-bench:v15-15.123.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
