@@ -180,3 +180,5 @@ Operational notes that cost real time here, worth keeping:
   (Docker could not give the mounted volumes the pod's uid). The mounts it
   needs — `sites/<site>`, `logs`, `/tmp` — are defined in
   `deploy/base/rollout.yaml`.
+
+<!-- AI review e2e check: 2026-10-26T11:59:34Z -->

@@ -93,6 +93,65 @@ def finish(status: str, detail: str, **metrics) -> NoReturn:
     sys.exit(0 if status == "pass" else 1)  # a verdict is final
 
 
+DIFF_CAP = 60000  # characters; the prompt renders this into one message
+
+
+def review_context(event: dict) -> dict:
+    """The `{hermes_context.*}` block the route's prompt renders.
+
+    The route prompt asks the reviewer to read an "AUTHENTICATED GITHUB PR
+    CONTEXT" diff, but the lab gateway only substitutes keys it finds in the
+    delivery payload — and a raw GitHub event has no diff. So the sender ships
+    one: same repo, same PR, fetched here where the token and the checkout
+    already exist. Without this the reviewer sees literal `{hermes_context...}`
+    placeholders and answers "Security review: NOT COMPLETED", which is a green
+    gate carrying no assurance.
+    """
+    pr = event.get("pull_request") or {}
+    repo = (event.get("repository") or {}).get("full_name", "")
+    number = event.get("number") or pr.get("number")
+    diff, reason = "", ""
+    if not (repo and number):
+        reason = "the delivery carried no repository/number"
+    else:
+        # The REST API, not `gh`: the sender runs in whatever image the repo
+        # pins, and a missing CLI must not silently turn into "no findings".
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/pulls/{number}",
+            headers={
+                "Accept": "application/vnd.github.v3.diff",
+                "User-Agent": "hermes-review-sender",
+                **({"Authorization": f"Bearer {token}"} if (token := env("GH_TOKEN") or env("GITHUB_TOKEN")) else {}),
+            },
+        )
+        try:
+            with _HTTP.open(req, timeout=180) as resp:
+                diff = resp.read().decode("utf-8", "replace")
+            if not diff.strip():
+                reason = "the API returned an empty diff"
+        except urllib.error.HTTPError as exc:
+            reason = f"HTTP {exc.code} fetching the diff ({exc.reason})"[:200]
+            diff = ""
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = f"{type(exc).__name__}: {exc}"[:200]
+            diff = ""
+    files = sorted({line.split(" b/", 1)[-1] for line in diff.splitlines() if line.startswith("diff --git ")})
+    if len(diff) > DIFF_CAP:
+        diff = diff[:DIFF_CAP] + f"\n\n[diff truncated at {DIFF_CAP} characters; {len(files)} files changed]\n"
+    ctx = {
+        "source": "pipeline (gh pr diff at the head commit)",
+        "diff_status": "ok" if diff else "unavailable",
+        "reason": reason or "n/a",
+        "file_count": str(len(files)),
+        "diff_bytes": str(len(diff.encode())),
+        "changed_files": ", ".join(files)[:2000] or "none",
+        "pr_diff": diff or "(the pipeline could not fetch the diff: " + (reason or "unknown") + ")",
+    }
+    print(f"context: {ctx['diff_status']} {ctx['diff_bytes']}b {ctx['file_count']} file(s)"
+          + (f" — {reason}" if reason else ""))
+    return ctx
+
+
 def forward(body: bytes) -> str:
     secret = env("HERMES_SECRET")
     if not secret:
@@ -243,6 +302,11 @@ def verdict(comment: dict) -> None:
         write_sarif(body)
     except OSError as exc:  # never turn a landed review into a red gate
         print(f"::warning::could not write the SARIF report: {exc}")
+    # "NOT COMPLETED" is the reviewer saying it could not look at the code.
+    # A gate that passes on that carries no assurance, so it fails — the same
+    # rule the rest of the dashboard follows: no evidence is not a pass.
+    if first.lower().startswith("security review: not completed"):
+        finish("fail", f"Hermes could not complete the review ({first}) — no assurance either way; see {link}", findings=0, blocking=0, verdict_line=first)
     if blocking:
         finish("fail", f"Hermes: {summary} — Critical/High block the merge; see {link}", findings=sum(counts.values()), blocking=blocking, verdict_line=first)
     finish("pass", f"Hermes: {first or 'review posted'} ({summary}; Medium/Low are advisory) — {link}", findings=sum(counts.values()), blocking=0, verdict_line=first)
@@ -251,27 +315,46 @@ def verdict(comment: dict) -> None:
 def main() -> None:
     head = env("HEAD_SHA")
     event_name = env("GITHUB_EVENT_NAME")
-    asked_at = None
+    attempts = max(1, int(env("REVIEW_ATTEMPTS", "3")))
+    budget = int(env("WAIT_SECONDS", "1500"))
+    per_attempt = max(120, budget // attempts)
+    event = None
     if event_name == "pull_request":
         with open(env("GITHUB_EVENT_PATH"), "rb") as f:
             event = json.load(f)
         if (event.get("pull_request") or {}).get("draft"):
             finish("fail", "draft PR — the AI review runs when the PR is marked ready for review")
+        event["hermes_context"] = review_context(event)
+    for attempt in range(1, attempts + 1):
         asked_at = dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(seconds=5)
-        print("review requested:", forward(json.dumps(event, separators=(",", ":")).encode()))
-    deadline = time.monotonic() + int(env("WAIT_SECONDS", "1500"))
-    while True:
-        try:
-            found = review_for(head, asked_at)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            print(f"::warning::GitHub comments API: {exc}; retrying")
-            found = None
-        if found:
-            verdict(found)
-        if time.monotonic() > deadline:
-            what = "for this head commit" if asked_at is None else "since this run requested it"
-            finish("fail", f"no Hermes review {what} within {env('WAIT_SECONDS', '1500')}s (commit {head[:7]}) — check the gateway log")
-        time.sleep(POLL_SECONDS)
+        if event is not None:
+            body = json.dumps(event, separators=(",", ":")).encode()
+            print(f"review requested ({attempt}/{attempts}):", forward(body))
+        deadline = time.monotonic() + per_attempt
+        while True:
+            try:
+                found = review_for(head, asked_at)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                print(f"::warning::GitHub comments API: {exc}; retrying")
+                found = None
+            if found:
+                first = (found.get("body") or "").strip().splitlines()
+                # The reviewer says "NOT COMPLETED" when it could not look at
+                # the code — a flaky model, not a finding. Ask again (the
+                # gateway runs a fresh turn per delivery) before failing, so a
+                # bad roll doesn't redden a clean PR and a real outage still
+                # fails after the last attempt.
+                if first and first[0].lower().startswith("security review: not completed") and attempt < attempts:
+                    print(f"::warning::review {attempt}/{attempts} came back NOT COMPLETED; asking again")
+                    break
+                verdict(found)
+            if time.monotonic() > deadline:
+                if attempt < attempts:
+                    print(f"::warning::no review within {per_attempt}s (attempt {attempt}/{attempts}); asking again")
+                    break
+                what = "for this head commit" if event_name != "pull_request" else "since this run requested it"
+                finish("fail", f"no Hermes review {what} within {budget}s over {attempts} attempt(s) (commit {head[:7]}) — check the gateway log")
+            time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
