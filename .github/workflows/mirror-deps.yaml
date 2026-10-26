@@ -20,8 +20,11 @@ permissions:
   packages: write
 
 env:
-  SOURCE_MARIADB: docker.io/library/mariadb:10.11@sha256:bb27bde261794d326398a9c998ddf9f35db45296d829123bff829cd076f68107
-  SOURCE_REDIS: docker.io/library/redis:7-alpine@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
+  # Digest only: skopeo refuses "tag@digest" ("Docker references with both a tag
+  # and digest are currently not supported"). The tag is applied on the way in,
+  # and the digest is what the manifests end up pinning.
+  SOURCE_MARIADB: docker.io/library/mariadb@sha256:bb27bde261794d326398a9c998ddf9f35db45296d829123bff829cd076f68107
+  SOURCE_REDIS: docker.io/library/redis@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
   DEST: ghcr.io/usfali-ke/frappe-gates-demo-deps
 
 jobs:
