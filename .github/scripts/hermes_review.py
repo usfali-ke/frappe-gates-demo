@@ -152,12 +152,16 @@ def review_context(event: dict) -> dict:
     return ctx
 
 
-def forward(body: bytes) -> str:
+def forward(body: bytes, seq: int = 1) -> str:
     secret = env("HERMES_SECRET")
     if not secret:
         finish("fail", "HERMES_WEBHOOK_SECRET is not set for this repository — the review can't be requested")
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    delivery = f"gha-{env('GITHUB_RUN_ID')}-{env('GITHUB_RUN_ATTEMPT', '1')}"
+    # One delivery id per REQUEST, not per workflow run: the gateway de-duplicates
+    # on X-GitHub-Delivery and answers {"status": "duplicate"} without running a
+    # turn, so a retry that reused the id silently did nothing. The `gha-<run>-`
+    # prefix stays so the gateway log is still greppable by run.
+    delivery = f"gha-{env('GITHUB_RUN_ID')}-{env('GITHUB_RUN_ATTEMPT', '1')}-r{seq}"
     req = urllib.request.Request(_http_url(env("HERMES_URL")), data=body, method="POST", headers={
         "Content-Type": "application/json", "X-GitHub-Event": "pull_request",
         "X-GitHub-Delivery": delivery, "X-Hub-Signature-256": sig,
@@ -329,7 +333,7 @@ def main() -> None:
         asked_at = dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(seconds=5)
         if event is not None:
             body = json.dumps(event, separators=(",", ":")).encode()
-            print(f"review requested ({attempt}/{attempts}):", forward(body))
+            print(f"review requested ({attempt}/{attempts}):", forward(body, attempt))
         deadline = time.monotonic() + per_attempt
         while True:
             try:
