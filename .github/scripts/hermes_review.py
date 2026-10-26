@@ -315,28 +315,46 @@ def verdict(comment: dict) -> None:
 def main() -> None:
     head = env("HEAD_SHA")
     event_name = env("GITHUB_EVENT_NAME")
-    asked_at = None
+    attempts = max(1, int(env("REVIEW_ATTEMPTS", "3")))
+    budget = int(env("WAIT_SECONDS", "1500"))
+    per_attempt = max(120, budget // attempts)
+    event = None
     if event_name == "pull_request":
         with open(env("GITHUB_EVENT_PATH"), "rb") as f:
             event = json.load(f)
         if (event.get("pull_request") or {}).get("draft"):
             finish("fail", "draft PR — the AI review runs when the PR is marked ready for review")
-        asked_at = dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(seconds=5)
         event["hermes_context"] = review_context(event)
-        print("review requested:", forward(json.dumps(event, separators=(",", ":")).encode()))
-    deadline = time.monotonic() + int(env("WAIT_SECONDS", "1500"))
-    while True:
-        try:
-            found = review_for(head, asked_at)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            print(f"::warning::GitHub comments API: {exc}; retrying")
-            found = None
-        if found:
-            verdict(found)
-        if time.monotonic() > deadline:
-            what = "for this head commit" if asked_at is None else "since this run requested it"
-            finish("fail", f"no Hermes review {what} within {env('WAIT_SECONDS', '1500')}s (commit {head[:7]}) — check the gateway log")
-        time.sleep(POLL_SECONDS)
+    for attempt in range(1, attempts + 1):
+        asked_at = dt.datetime.now(dt.UTC).replace(microsecond=0) - dt.timedelta(seconds=5)
+        if event is not None:
+            body = json.dumps(event, separators=(",", ":")).encode()
+            print(f"review requested ({attempt}/{attempts}):", forward(body))
+        deadline = time.monotonic() + per_attempt
+        while True:
+            try:
+                found = review_for(head, asked_at)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                print(f"::warning::GitHub comments API: {exc}; retrying")
+                found = None
+            if found:
+                first = (found.get("body") or "").strip().splitlines()
+                # The reviewer says "NOT COMPLETED" when it could not look at
+                # the code — a flaky model, not a finding. Ask again (the
+                # gateway runs a fresh turn per delivery) before failing, so a
+                # bad roll doesn't redden a clean PR and a real outage still
+                # fails after the last attempt.
+                if first and first[0].lower().startswith("security review: not completed") and attempt < attempts:
+                    print(f"::warning::review {attempt}/{attempts} came back NOT COMPLETED; asking again")
+                    break
+                verdict(found)
+            if time.monotonic() > deadline:
+                if attempt < attempts:
+                    print(f"::warning::no review within {per_attempt}s (attempt {attempt}/{attempts}); asking again")
+                    break
+                what = "for this head commit" if event_name != "pull_request" else "since this run requested it"
+                finish("fail", f"no Hermes review {what} within {budget}s over {attempts} attempt(s) (commit {head[:7]}) — check the gateway log")
+            time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
