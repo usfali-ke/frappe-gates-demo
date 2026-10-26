@@ -509,7 +509,11 @@ jobs:
 
   gate-g1:
     name: G1 merge gate (Develop → Build)
-    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed, ai-review]
+    # ai-review is deliberately not listed: its job is commented out above, and
+    # a `needs` naming a job that does not exist makes the whole workflow
+    # invalid (GitHub then runs nothing at all). The criterion is recorded as
+    # skipped-with-reason by gate.py, not silently passed.
+    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed]
     if: always() && startsWith(github.event_name, 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1181,7 +1185,7 @@ jobs:
   evidence:
     name: Release · evidence bundle
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
-            reviewers, commits-signed, ai-review, image-scan, sbom, image-compliance, frappe-migrate-check, publish,
+            reviewers, commits-signed, image-scan, sbom, image-compliance, frappe-migrate-check, publish,
             gate-g1, gate-g2]
     if: always()
     runs-on: ubuntu-latest
@@ -1198,7 +1202,7 @@ jobs:
       # Controls that apply to this event; the rest aren't listed as missing.
       CONTROLS: >-
         build,unit-tests,coverage,code-quality,sast-semgrep,secrets-gitleaks,secrets-trufflehog,
-        sca-trivy,iac-checkov,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,ai-review,' || '' }}image-scan,sbom,
+        sca-trivy,iac-checkov,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,' || '' }}image-scan,sbom,
         image-compliance,frappe-migrate-check,publish
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

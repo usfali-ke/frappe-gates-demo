@@ -128,6 +128,19 @@ GATES = {
 }
 
 
+# Controls deliberately turned off in the workflow. They stay in their gate so
+# the dashboard sees them, but they are recorded as skipped with the reason: a
+# control that did not run must never read as a pass.
+DISABLED = {
+    ("G1", "ai_security_review_clean"): (
+        "disabled in devsecops-pipeline.yml (the ai-review job is commented out): the lab Hermes "
+        "gateway's model returned \"NOT COMPLETED\" for roughly half of the review requests even with "
+        "the PR diff delivered, so the control was switched off rather than left flaky. No AI review "
+        "exists for this run."
+    ),
+}
+
+
 def verdict(needs, job, output):
     j = needs.get(job) or {}
     try:
@@ -167,7 +180,15 @@ def main():
     # Every report is in the run's artifacts (report-<control>, and the
     # signed `evidence` bundle).
     profile = f"{gate}@{e('PROFILE')}" if e("PROFILE") else gate
+    # A deliberately disabled control does not block its gate; it is still
+    # reported as skipped, so the evidence shows a gap instead of a pass.
+    allow_skipped |= {key for (gate_name, key) in DISABLED if gate_name == profile}
     criteria = [criterion(needs, *c, evidence_url=f"{run_url}#artifacts") for c in GATES[profile]]
+    for c in criteria:
+        reason = DISABLED.get((profile, c["key"]))
+        if reason:
+            c["status"] = "skipped"
+            c["detail"] = reason
     ok = all(c["status"] == "pass" or (c["status"] == "skipped" and c["key"] in allow_skipped) for c in criteria)
     status = "pass" if ok else "fail"
     now = dt.datetime.now(dt.timezone.utc).isoformat()
