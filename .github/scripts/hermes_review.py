@@ -302,6 +302,11 @@ def verdict(comment: dict) -> None:
         write_sarif(body)
     except OSError as exc:  # never turn a landed review into a red gate
         print(f"::warning::could not write the SARIF report: {exc}")
+    # "NOT COMPLETED" is the reviewer saying it could not look at the code.
+    # A gate that passes on that carries no assurance, so it fails — the same
+    # rule the rest of the dashboard follows: no evidence is not a pass.
+    if first.lower().startswith("security review: not completed"):
+        finish("fail", f"Hermes could not complete the review ({first}) — no assurance either way; see {link}", findings=0, blocking=0, verdict_line=first)
     if blocking:
         finish("fail", f"Hermes: {summary} — Critical/High block the merge; see {link}", findings=sum(counts.values()), blocking=blocking, verdict_line=first)
     finish("pass", f"Hermes: {first or 'review posted'} ({summary}; Medium/Low are advisory) — {link}", findings=sum(counts.values()), blocking=0, verdict_line=first)
