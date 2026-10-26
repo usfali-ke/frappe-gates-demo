@@ -1,0 +1,57 @@
+# Publishes the bench base image the app Dockerfile builds on, BY DIGEST.
+#
+# Run by hand (Actions → bench-image → Run workflow) when the framework pin in
+# docker/bench.Dockerfile changes. The output digest is then written into the
+# app Dockerfile's FROM line, which is what makes the app image reproducible:
+# its only inputs are that pinned base and this repository's source.
+#
+# Needs no secrets: GHCR accepts the run's own GITHUB_TOKEN with packages: write.
+name: bench-image
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "docker/bench.Dockerfile"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/usfali-ke/frappe-gates-demo-bench
+  FRAPPE_VERSION: v15.123.1
+
+jobs:
+  build:
+    name: Build + push the bench base
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: build
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --build-arg "FRAPPE_VERSION=${FRAPPE_VERSION}" \
+            -f docker/bench.Dockerfile \
+            -t "${IMAGE}:v15-${FRAPPE_VERSION#v}" \
+            --push \
+            --metadata-file /tmp/meta.json .
+          digest=$(jq -r '."container.image.name" // empty' /tmp/meta.json 2>/dev/null || true)
+          dig=$(jq -r '."containerimage.digest" // empty' /tmp/meta.json)
+          echo "digest=${dig}" >> "$GITHUB_OUTPUT"
+      - name: Print the FROM line to pin
+        run: |
+          echo "Pin this in the app Dockerfile:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "FROM ${IMAGE}:v15-${FRAPPE_VERSION#v}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

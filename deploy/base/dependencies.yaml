@@ -8,6 +8,12 @@
 #
 # The Secret `frappe-gates-demo` is created out of band (never in git) with
 # keys `db-root-password` and `admin-password`.
+#
+# checkov exceptions (documented, not silenced):
+#   CKV2_K8S_6  NetworkPolicy is platform-owned — the products AppProject
+#               blacklists networking.k8s.io/NetworkPolicy for product repos.
+#   CKV_K8S_35  MariaDB takes its root password from the environment, the only
+#               way mariadbd's entrypoint accepts it; read once at start.
 ---
 apiVersion: v1
 kind: Service
@@ -29,6 +35,10 @@ metadata:
   name: frappe-gates-demo-mariadb
   labels:
     app: frappe-gates-demo-mariadb
+  annotations:
+    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy is platform-owned; the products AppProject forbids product repos from shipping one
+    checkov.io/skip2: CKV_K8S_35=The MariaDB root password is only configurable through the environment; read once at start
+    checkov.io/skip3: CKV_K8S_40=The MariaDB image's own mysql account is uid 999; mariadbd is not supported running as an arbitrary uid, and fsGroup already gives that uid the data volume
 spec:
   replicas: 1
   serviceName: frappe-gates-demo-mariadb
@@ -42,12 +52,17 @@ spec:
     spec:
       automountServiceAccountToken: false
       securityContext:
+        # The image's mysql user is uid 999; fsGroup hands it the data volume.
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
         fsGroup: 999
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: mariadb
-          image: mariadb:10.11
+          image: mariadb:10.11@sha256:bb27bde261794d326398a9c998ddf9f35db45296d829123bff829cd076f68107
+          imagePullPolicy: Always
           args:
             - --character-set-server=utf8mb4
             - --collation-server=utf8mb4_unicode_ci
@@ -65,6 +80,7 @@ spec:
               protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             privileged: false
             capabilities:
               drop: ["ALL"]
@@ -73,6 +89,8 @@ spec:
               mountPath: /var/lib/mysql
             - name: run
               mountPath: /run/mysqld
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             exec:
               command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
@@ -96,6 +114,9 @@ spec:
         - name: run
           emptyDir:
             sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -127,6 +148,8 @@ metadata:
   name: frappe-gates-demo-redis
   labels:
     app: frappe-gates-demo-redis
+  annotations:
+    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy is platform-owned; the products AppProject forbids product repos from shipping one
 spec:
   replicas: 1
   selector:
@@ -140,14 +163,16 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
-        runAsUser: 999
-        runAsGroup: 999
-        fsGroup: 999
+        # Any high uid works for redis; keep it clear of host ranges (CKV_K8S_40).
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: redis
-          image: redis:7-alpine
+          image: redis:7-alpine@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
+          imagePullPolicy: Always
           args: ["--save", "", "--appendonly", "no", "--maxmemory", "128mb"]
           ports:
             - name: redis
@@ -167,6 +192,12 @@ spec:
               command: ["redis-cli", "ping"]
             initialDelaySeconds: 3
             periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 4
           resources:
             requests:
               cpu: 10m

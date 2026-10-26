@@ -315,8 +315,9 @@ jobs:
           python -m pip install --quiet "frappe-bench==5.31.0" "coverage~=7.6" "unittest-xml-reporting~=3.2" || rc=$?
           # bench resolves its bench directory from the working directory.
           b() { ( cd "$BENCH_DIR" && bench "$@" ); }
-          [ "$rc" != 0 ] || b init --frappe-branch "$FRAPPE_BRANCH" --skip-redis-config-generation \
-            --skip-assets --python python3.11 "$BENCH_DIR" || rc=$?
+          # bench init CREATES $BENCH_DIR, so it runs from the workspace.
+          [ "$rc" != 0 ] || ( cd "$GITHUB_WORKSPACE" && bench init --frappe-branch "$FRAPPE_BRANCH" \
+            --skip-redis-config-generation --skip-assets --python python3.11 "$BENCH_DIR" ) || rc=$?
           [ "$rc" != 0 ] || b get-app "$GITHUB_WORKSPACE" || rc=$?
           [ "$rc" != 0 ] || b new-site test_site \
             --db-host "$DB_HOST" --db-port "$DB_PORT" \
@@ -530,7 +531,8 @@ jobs:
     # under branch protection) and Build proceeds.
     if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A Frappe bench build is minutes, not seconds; the double build has to fit.
+    timeout-minutes: 45
     permissions:
       contents: read
     outputs:
