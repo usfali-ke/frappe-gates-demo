@@ -13,6 +13,8 @@ omit =
     */patches/*
     */templates/*
     */config/*
+    # The CLI shim the release runs inside the pod; the live suite exercises it.
+    */ensure_user.py
 exclude_lines =
     pragma: no cover
     if TYPE_CHECKING:

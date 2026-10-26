@@ -19,24 +19,13 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/home/frappe/frappe-bench/env/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 WORKDIR /home/frappe/frappe-bench
+# COPY only, no RUN: the base image already registers the app (apps.txt, the
+# import path) and holds the pristine sites/ template. A RUN here would stamp
+# files with the build time, and the reproducible-build control compares the
+# digests of the cached and --no-cache builds.
 COPY --chown=10001:10001 . /home/frappe/frappe-bench/apps/frappe_gates_demo
-
-# Register the app the way `bench get-app` would (apps.txt + import path)
-# without running pip: the app has no dependencies, and a pip call here would
-# pull live index metadata into the layer and break reproducibility.
-# The site directory is the writable volume in a cluster, and a volume mounted
-# at sites/ HIDES this tree — including the built assets and apps.txt. Keep a
-# pristine copy outside sites/ so the entrypoint can restore it into a fresh
-# volume.
-RUN printf 'frappe\nfrappe_gates_demo\n' > sites/apps.txt \
- && printf '/home/frappe/frappe-bench/apps/frappe\n/home/frappe/frappe-bench/apps/frappe_gates_demo\n' \
-      > env/lib/python3.11/site-packages/frappe_apps.pth \
- && mkdir -p sites/assets logs \
- && cp -a sites /home/frappe/sites-template
-
-COPY --chown=10001:10001 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chown=10001:10001 --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chown=10001:10001 docker/wsgi.py /home/frappe/frappe-bench/wsgi_site.py
-RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 # Numeric, so runAsNonRoot verifies it without an /etc/passwd entry (the base
 # image creates uid 10001, so Frappe's getpass.getuser() still resolves).
