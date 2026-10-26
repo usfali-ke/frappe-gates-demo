@@ -44,6 +44,15 @@ SEVERITY_ROW = re.compile(r"^\|\s*\**\s*(Critical|High|Medium|Low|Info)\b", re.I
 BLOCKING = {"critical", "high"}
 POLL_SECONDS = 20
 
+# The review is a PR comment with one markdown table row per finding. Those
+# rows are also written as SARIF so DefectDojo can import them as a scanner
+# (defectdojo-upload.yml) instead of the AI review living only in a comment.
+SARIF_LEVEL = {"critical": "error", "high": "error", "medium": "warning", "low": "note", "info": "note"}
+# security-severity is what DefectDojo's SARIF parser maps to its own severity,
+# so Critical survives the trip (error/warning/note alone would collapse it).
+SEVERITY_SCORE = {"critical": "9.5", "high": "8.0", "medium": "5.5", "low": "3.0", "info": "0.0"}
+FILE_CELL = re.compile(r"([\w./-]+\.(?:py|js|ts|tsx|jsx|json|toml|yaml|yml|html|htm|sh|md|conf|ini|cfg))(?::(\d+))?")
+
 
 def _http_url(url: str) -> str:
     """Only http(s): a file://, ftp:// or data: URL is never opened."""
@@ -121,6 +130,91 @@ def comments(since: dt.datetime | None) -> list[dict]:
     return out
 
 
+def findings_from(body: str) -> list[dict]:
+    """One dict per markdown table row the reviewer wrote.
+
+    Tolerant on purpose: the row layout belongs to the reviewer, so the file
+    and the line are found by pattern, and the description is the longest
+    remaining cell. A row with no file still becomes a finding, with the
+    comment as its location.
+    """
+    out: list[dict] = []
+    for line in body.splitlines():
+        m = SEVERITY_ROW.match(line)
+        if not m:
+            continue
+        cells = [c.strip().strip("*` ") for c in line.strip().strip("|").split("|")]
+        severity = m.group(1).lower()
+        file_name, start_line = None, 1
+        for cell in cells:
+            fm = FILE_CELL.search(cell)
+            if fm:
+                file_name, start_line = fm.group(1), int(fm.group(2) or 1)
+                break
+        description = max(
+            (c for c in cells if c and c.lower() != severity and not FILE_CELL.search(c)),
+            key=len,
+            default="AI review finding",
+        )
+        out.append({"severity": severity, "file": file_name, "line": start_line, "message": description[:500]})
+    return out
+
+
+def write_sarif(body: str) -> int:
+    """Write reports/ai-review/ai-review.sarif from the review's table rows."""
+    rows = findings_from(body)
+    rule_ids = {f"hermes-ai-review/{f['severity']}" for f in rows}
+    rules = [
+        {
+            "id": rid,
+            "name": rid.split("/")[-1],
+            "shortDescription": {"text": f"AI security review: {rid.split('/')[-1]}"},
+            "properties": {"security-severity": SEVERITY_SCORE[rid.split("/")[-1]]},
+        }
+        for rid in sorted(rule_ids)
+    ]
+    results = [
+        {
+            "ruleId": f"hermes-ai-review/{f['severity']}",
+            "level": SARIF_LEVEL[f["severity"]],
+            "message": {"text": f["message"]},
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": f["file"] or "."},
+                        "region": {"startLine": max(1, f["line"])},
+                    }
+                }
+            ],
+            "properties": {"security-severity": SEVERITY_SCORE[f["severity"]]},
+        }
+        for f in rows
+    ]
+    doc = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "Hermes AI security review",
+                        "informationUri": "https://github.com/NousResearch/hermes",
+                        "rules": rules,
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+    out_dir = env("OUT") or "reports/ai-review"
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "ai-review.sarif")
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2)
+    print(f"wrote {path} ({len(results)} finding(s))")
+    return len(results)
+
+
 def review_for(head: str, asked_at: dt.datetime | None) -> dict | None:
     commenter = env("HERMES_COMMENTER")
     for c in reversed(comments(asked_at)):  # newest first
@@ -145,6 +239,10 @@ def verdict(comment: dict) -> None:
     blocking = sum(n for s, n in counts.items() if s in BLOCKING)
     summary = ", ".join(f"{n} {s.title()}" for s, n in sorted(counts.items(), key=lambda kv: ["critical", "high", "medium", "low", "info"].index(kv[0]))) or "no findings"
     link = comment.get("html_url", "")
+    try:
+        write_sarif(body)
+    except OSError as exc:  # never turn a landed review into a red gate
+        print(f"::warning::could not write the SARIF report: {exc}")
     if blocking:
         finish("fail", f"Hermes: {summary} — Critical/High block the merge; see {link}", findings=sum(counts.values()), blocking=blocking, verdict_line=first)
     finish("pass", f"Hermes: {first or 'review posted'} ({summary}; Medium/Low are advisory) — {link}", findings=sum(counts.values()), blocking=0, verdict_line=first)

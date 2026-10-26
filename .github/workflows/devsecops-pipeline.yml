@@ -11,7 +11,14 @@
 #     ── G1 merge gate (Develop → Build, on pull requests): reviewed,
 #        signed, tested, no SAST or secret findings. A failed G1 skips
 #        every Build job — the pipeline does not proceed to the phase ──
-#   Build     reproducible image (built twice) · SCA (trivy, lockfile) ·
+#   Build     ONE pipeline, in this order, and the order is the guarantee:
+#             build the image (in the runner, never pushed) → scan it
+#             (trivy OS+packages+secrets, dockle CIS) → ANY Critical/High
+#             fails the scan control → G2 → and only then `publish`, which
+#             re-checks every control and refuses to push a red artifact.
+#             A vulnerable image therefore cannot be pushed and cannot reach
+#             a cluster, and a red Build makes the PR check red (merge).
+#             reproducible image (built twice) · SCA (trivy, lockfile) ·
 #             IaC (checkov) · the built image: trivy · syft SBOM · dockle
 #             (CIS) · django check --deploy; then, main only and only if
 #             every control passed: push the exact built digest to GHCR,
@@ -745,6 +752,10 @@ jobs:
       VERDICT_FILE: reports/image-scan/verdict.json
       NATIVE: reports/image-scan/trivy.txt
       DIGEST: ${{ needs.build.outputs.digest }}
+      # Every Critical/High in the image blocks, fixed upstream or not: a
+      # vulnerable artifact is not pushed and never reaches a cluster. (The
+      # default only blocks the ones with a released fix.)
+      BLOCK_UNFIXED: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -958,8 +969,13 @@ jobs:
           path: reports/frappe-migrate-check/
           if-no-files-found: ignore
 
+  # The last Build step: push ONLY an image that passed every scan. The job
+  # still runs when a scan is red — it then fails with the list of red
+  # controls and pushes nothing, so the pipeline breaks loudly instead of a
+  # skipped job looking like a quiet success. A vulnerable image is never
+  # pushed and never reaches a cluster.
   publish:
-    name: Build · push + sign + attest (GHCR)
+    name: Build · push + sign + attest (only when every scan passed)
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog,
             sca-trivy, iac-checkov, image-scan, sbom, image-compliance, frappe-migrate-check]
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
@@ -998,6 +1014,24 @@ jobs:
           not_ready=$(jq -r 'to_entries | map(select(.value.result != "success") | .key) | join(", ")' <<<"$NEEDS")
           echo "not_ready=$not_ready" >> "$GITHUB_OUTPUT"
           echo "go=$([ -z "$not_ready" ] && [ "$PUBLISH" = true ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Refuse to push (scans red or incomplete)
+        # go == false is two different situations: a red control (fail here,
+        # loudly) or a pull request, where publishing is deliberately off
+        # (the image is built and scanned, never pushed).
+        if: steps.ready.outputs.go != 'true'
+        env:
+          NOT_READY: ${{ steps.ready.outputs.not_ready }}
+          PUBLISH: ${{ env.PUBLISH }}
+        run: |
+          set -uo pipefail
+          if [ -n "${NOT_READY// /}" ]; then
+            echo "::error::image NOT pushed — these controls did not pass: ${NOT_READY}"
+            echo "### Image not pushed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Red controls: \`${NOT_READY}\` — a Critical/High finding in the image, or any" >> "$GITHUB_STEP_SUMMARY"
+            echo "other Build control, keeps the artifact out of the registry." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "not pushing: this run is not a main push (preview builds are built and scanned only)"
       - if: steps.ready.outputs.go == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
