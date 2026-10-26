@@ -1,0 +1,4 @@
+# The environment test job's self-hosted runner (README: "Environment test runner").
+self-hosted-runner:
+  labels:
+    - django-gates-demo-env

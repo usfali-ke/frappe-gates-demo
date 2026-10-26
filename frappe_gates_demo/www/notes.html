@@ -1,0 +1,49 @@
+{% extends "templates/web.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block page_content %}
+<div class="fgd-notes">
+	<h1>{{ title }}</h1>
+	<p class="text-muted">
+		Signed in as {{ full_name }} &middot; {{ stats.open }} open of {{ stats.total }} notes
+		{% if stats.highest_open_severity %}&middot; highest open: {{ stats.highest_open_severity }}{% endif %}
+	</p>
+
+	<form class="fgd-form" method="post" action="/api/method/frappe_gates_demo.api.note_create">
+		<input type="hidden" name="csrf_token" value="{{ frappe.session.csrf_token }}">
+		<label for="title">Title</label>
+		<input id="title" name="title" maxlength="140" required>
+		<label for="severity">Severity</label>
+		<select id="severity" name="severity">
+			{% for severity in severities %}
+			<option value="{{ severity }}"{% if severity == "Medium" %} selected{% endif %}>{{ severity }}</option>
+			{% endfor %}
+		</select>
+		<label for="body">Body</label>
+		<textarea id="body" name="body" rows="3" maxlength="5000"></textarea>
+		<button type="submit">Add note</button>
+	</form>
+
+	<table class="table table-sm fgd-table">
+		<thead>
+			<tr><th>Note</th><th>Title</th><th>Severity</th><th>Status</th><th>Owner</th><th>Age</th></tr>
+		</thead>
+		<tbody>
+			{% for note in notes %}
+			<tr>
+				<td>{{ note.name }}</td>
+				<td>{{ note.title }}{% if note.pinned %} <span class="fgd-pin">pinned</span>{% endif %}</td>
+				<td>{{ note.severity }}</td>
+				<td>{{ note.status }}</td>
+				<td>{{ note.note_owner }}</td>
+				<td>{{ note.age_days }}d</td>
+			</tr>
+			{% endfor %}
+		</tbody>
+	</table>
+	{% if not notes %}
+	<p>No notes yet — add the first one above.</p>
+	{% endif %}
+</div>
+{% endblock %}

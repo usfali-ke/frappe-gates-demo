@@ -1,0 +1,1753 @@
+# One environment of the release pipeline (devsecops-release.yml calls it
+# for dev, staging and prod in turn): the same digest all the way, and
+# every test runs against the environment AFTER that digest is deployed
+# to it.
+#
+#   dev      the digest devsecops-pipeline.yml built, signed and passed
+#            through its Control Gate (G2) for a main commit (input `commit`)
+#   staging  the digest running in dev, once G6 verified it there and G3
+#            passed against it there
+#   prod     the digest running in staging, once G6 verified it and G3
+#            passed against it there, and only after prod's own approval
+#   rollback (kind) the digest the environment ran before its last deploy:
+#            that deploy commit's Rollback-Digest trailer
+#
+# The SDLC phases in the order this stage runs them, the control gate at
+# each boundary (docs/DevSecOps_process.docx). A failed gate breaks the
+# pipeline: the stage fails and no later phase — and no later environment
+# — runs. Jobs within a phase run in parallel:
+#
+#   Deliver    which digest this environment may get, and may it be
+#              delivered at all: resolve → `promotion` (the digest the
+#              previous stage deployed, still the one this run expects;
+#              the criterion is G5's approved_gitops_pipeline_path — a
+#              release reaches an environment only through this pipeline)
+#              · provenance + evidence (G5 artifact_provenance_verified:
+#              signature, SBOM, SLSA for the commit that built the
+#              digest; the pipeline's G2 passed for it) · config (G5
+#              target_env_config_controlled: deploy/<env> schema-valid,
+#              checkov-clean, only the digest changes) · staging/prod:
+#              previous-env-tests (the previous environment's G3, from
+#              its signed release record)
+#   Release    the candidate's records: release notes (every change since
+#              what the environment runs now) · rollback plan (what runs
+#              now: still signed and pullable — G5 rollback_plan_ready).
+#              Both run in parallel with the Deliver checks; the approver
+#              reads them with the checks' evidence. Then the phase's
+#              approval, which only prod has: the `release-approval`
+#              environment review (segregation of duties; G5@prod
+#              promotion_approved_by_other). dev and staging have no
+#              approval step at all — nothing about them differs from prod
+#              but that one job
+#   G5         deployment gate — every Deliver criterion plus the
+#              approval, BEFORE anything is committed. A failed G5 skips
+#              Deploy and the whole stage fails
+#   Deploy     the digest committed to deploy/<env> (GitOps; Argo CD
+#              syncs). Admission is the G6 half that happens on the
+#              cluster: Kyverno verifies the cosign signature and the
+#              approved registry at pod admission, Argo runs the canary
+#              analysis, and the dashboard mirrors the result as commit
+#              status `security-dashboard/G6/<env>` — post-deploy waits
+#              for it (the admission half of G6), so a rejected admission
+#              fails the stage here
+#   Test       one job per control against the deployed environment (see
+#              "Test" below):
+#              dev      functional (smoke, integration) · regression ·
+#                       security (authenticated, DAST nuclei, dependency
+#                       re-check of the deployed digest)
+#              staging  functional (smoke, end-to-end) · regression ·
+#                       performance (k6) · security (authenticated, DAST
+#                       nuclei, TLS testssl.sh)
+#              prod     read-only smoke (no test users, no writes)
+#   Monitor    the health watch on the new pods (probes, latency SLO,
+#              restarts) — prod only, in parallel with the Test jobs; it
+#              is the G6 criterion post_deploy_health_watch_green, so the
+#              gate below counts it. The doc's Monitor phase proper
+#              (G7/CONMON: SIEM, runtime threat detection, SLO telemetry)
+#              is not a pipeline job — the cluster's reporter and Wazuh
+#              push it to the dashboard continuously
+#   G3 / G6    the test gate — the phase boundary to the next
+#              environment. G3 (dev, staging): every test job above
+#              answers a criterion; one that should have run but was
+#              skipped or failed fails the gate, so the stage fails and
+#              the next environment never starts. G6@prod: smoke + health
+#              watch; a failure starts the automatic rollback
+#   Record     every report + hash manifest → artifact `release-evidence-<env>`
+#              (90 days); after a deploy, attested to the image digest.
+#              Runs even when the stage failed — the honest record of
+#              what happened is itself evidence. The next environment's
+#              Deliver checks read it
+#
+# One release run deploys to several environments, so every artifact is
+# named per environment (`report-<env>-<control>`, `gate-result-<G>-<env>`,
+# `deployment-event-<env>`). Nothing here talks to the cluster except the
+# environment tests: a deploy is a commit that Argo CD syncs.
+
+name: devsecops-stage
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev | staging | prod
+        required: true
+        type: string
+      kind:
+        description: planned | hotfix | fix_forward | rollback
+        required: true
+        type: string
+      commit:
+        description: dev only — the main commit whose image to deploy (default the commit this runs on)
+        required: false
+        type: string
+        default: ""
+      allow-self-approval:
+        description: 'SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode), prod only: approve with the starter/author account. Opt-in per run; the waiver is recorded in the verdict detail.'
+        required: false
+        type: string
+        default: ""
+      expect-digest:
+        description: The digest the previous stage of this run deployed; resolve fails if the previous environment has moved on since
+        required: false
+        type: string
+        default: ""
+    # Declared so a caller that forgets to pass it fails at the call, not
+    # deep inside the deploy job. Only the deploy job consumes it: the key
+    # that carries the GitOps commit past main's ruleset.
+    secrets:
+      GITOPS_DEPLOY_KEY:
+        description: Write deploy key whose public half is the ruleset's bypass actor (repo secret).
+        required: true
+    outputs:
+      digest:
+        value: ${{ jobs.resolve.outputs.digest }}
+      source-sha:
+        value: ${{ jobs.resolve.outputs.source-sha }}
+      gitops-sha:
+        value: ${{ jobs.deploy.outputs.gitops-sha }}
+
+permissions: {}
+
+env:
+  IMAGE: ghcr.io/usfali-ke/frappe-gates-demo
+  TARGET_ENV: ${{ inputs.environment }}
+  KUSTOMIZATION: deploy/${{ inputs.environment }}/kustomization.yaml
+  KIND: ${{ inputs.kind }}
+  # Only the pipeline on main signs releasable images.
+  CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
+  CERT_ISSUER: https://token.actions.githubusercontent.com
+  EVIDENCE_TYPE: https://github.com/${{ github.repository }}/evidence/v1
+  RELEASE_EVIDENCE_TYPE: https://github.com/${{ github.repository }}/release-evidence/v1
+  # Release records are signed by this workflow on main (earlier ones by
+  # devsecops-release.yml, when it ran every job itself). A reusable
+  # workflow's certificate names the called workflow, so the repository is
+  # pinned too: another repository calling this one can't sign as it.
+  RELEASE_IDENTITY_REGEXP: ^https://github\.com/${{ github.repository }}/\.github/workflows/devsecops-(release|stage)\.yml@refs/heads/main$
+  CHECKOV: bridgecrew/checkov:3.3.20@sha256:6d20ebbcde58b2dce6e3151a6771fefa4d468281fe442475455623f5799b9f53
+  KUBECONFORM: ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e
+  UV_VERSION: "0.12.19"
+  # Environment tests. TRIVY is the pipeline's image scanner, so the
+  # re-check in dev judges the deployed digest the way the build did.
+  K6: grafana/k6:2.3.0@sha256:e66db15b860113878fa74670e31f5e274830b7b6e42c8bff28b2f2d86a257603
+  NUCLEI: projectdiscovery/nuclei:v3.11.1@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb
+  NUCLEI_TEMPLATES: v10.4.9
+  NUCLEI_TEMPLATES_COMMIT: 893122ffce8ebf8e264f15d2cd3960cb1dd36d6c
+  TESTSSL: drwetter/testssl.sh:3.2.4@sha256:e38206bd09f48e8b4022ee8480ad3be93bfecfc4e5b5e4c5f7aca5c4bec4da52
+  TRIVY: aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+  CADDY: caddy:2.11.4@sha256:0c994536bddb66445885237f1a5dcc1916bccea922661c76b4e9fc24061f9b52
+  SLO_P95_MS: "500"
+  HEALTH_WATCH_SECONDS: "300"
+
+jobs:
+  # ── Deliver: which digest this environment may get, and may it be
+  #    delivered at all — the doc's Deliver phase; its gate is G5, below.
+  #    resolve is the entry job; provenance/evidence/config fan out from
+  #    it, and the Release records run in the same wave, in parallel. ─────
+  resolve:
+    name: Deliver · resolve the digest (promotion)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+      statuses: read
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      source-sha: ${{ steps.digest.outputs.source }}
+      started-at: ${{ steps.digest.outputs.at }}
+      promotion: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: promotion
+      OUT: reports/promotion
+      VERDICT_FILE: reports/promotion/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ inputs.commit }}
+          EXPECT: ${{ inputs.expect-digest }}
+        # dev takes a main commit's image. staging and prod take what the
+        # previous environment runs: the digest in its kustomization, and
+        # the commit that built it from the deploy commit's Source-Commit
+        # trailer (provenance and evidence-check verify both against the
+        # signatures, so a hand-edited trailer can't pass). That deploy
+        # commit must carry a successful G6 for the previous environment.
+        # A rollback takes the digest this environment ran before its last
+        # deploy (Rollback-Digest/-Source, recorded by that deploy).
+        # History is read from origin/main as it is now: the previous stage
+        # of this run pushed its deploy commit after this run started.
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          fail() { { echo "status=fail"; echo "detail=$1"; echo "at=$at"; } >> "$GITHUB_OUTPUT"; exit 0; }
+          git fetch -q origin main
+          last_deploy() { deploy_sha=$(git log -1 --format=%H origin/main -- "deploy/$1/kustomization.yaml"); }
+          trailer() { git log -1 --format="%(trailers:key=$1,valueonly)" "$deploy_sha" | head -1 | tr -d '[:space:]'; }
+          [ -z "$COMMIT" ] || [ "$TARGET_ENV" = dev ] || fail "input commit is for dev only; ${TARGET_ENV} takes what the previous environment runs"
+          if [ "$KIND" = rollback ]; then
+            last_deploy "$TARGET_ENV"
+            [ "$(trailer Environment)" = "$TARGET_ENV" ] \
+              || fail "${KUSTOMIZATION} was last changed by ${deploy_sha:0:7}, which isn't a ${TARGET_ENV} deploy by the release pipeline: nothing to roll back"
+            digest=$(trailer Rollback-Digest)
+            source=$(trailer Rollback-Source)
+            [ -n "$digest" ] && [ -n "$source" ] || fail "${deploy_sha:0:7} records no rollback target (no Rollback-Digest/Rollback-Source trailer)"
+            git cat-file -e "${source}^{commit}" 2>/dev/null || fail "Rollback-Source ${source:0:7} of ${deploy_sha:0:7} isn't in this repository"
+            detail="rollback: ${TARGET_ENV} gets ${digest:0:19}… (built from ${source:0:7}) back, the digest it ran before ${deploy_sha:0:7}"
+          else
+            case "$TARGET_ENV" in
+              dev)
+                source=${COMMIT:-$GITHUB_SHA}
+                [[ "$source" =~ ^[0-9a-f]{40}$ ]] || fail "commit '${source}' isn't a full commit SHA"
+                git merge-base --is-ancestor "$source" origin/main 2>/dev/null || fail "${source:0:12} isn't a commit on main"
+                digest=$(skopeo inspect --format '{{.Digest}}' "docker://${IMAGE}:sha-${source}" 2>/dev/null) || digest=""
+                [ -n "$digest" ] || fail "no image ${IMAGE}:sha-${source}: devsecops-pipeline didn't publish that commit (the Control Gate failed, or it hasn't finished)"
+                detail="dev gets the digest devsecops-pipeline built from ${source:0:7}" ;;
+              staging|prod)
+                prev=$([ "$TARGET_ENV" = staging ] && echo dev || echo staging)
+                file="deploy/${prev}/kustomization.yaml"
+                last_deploy "$prev"
+                digest=$(git show "${deploy_sha}:${file}" | sed -nE 's/^    digest: (sha256:[0-9a-f]{64})$/\1/p')
+                source=$(trailer Source-Commit)
+                [ "$(trailer Environment)" = "$prev" ] && [ -n "$source" ] && [ "$(trailer Image-Digest)" = "$digest" ] \
+                  || fail "${file} was last changed by ${deploy_sha:0:7}, which isn't a ${prev} deploy by the release pipeline: release to ${prev} first"
+                # A newer release reached the previous environment while
+                # this one waited: that one carries on, this one stops.
+                [ -z "$EXPECT" ] || [ "$digest" = "$EXPECT" ] \
+                  || fail "${prev} now runs ${digest:0:19}… (${deploy_sha:0:7}), not ${EXPECT:0:19}… that this run deployed there: superseded by a newer release"
+                git cat-file -e "${source}^{commit}" 2>/dev/null || fail "Source-Commit ${source:0:7} of ${deploy_sha:0:7} isn't in this repository"
+                # Each environment has its own context: one deploy commit
+                # can carry G6 for several (they all track main).
+                g6=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${deploy_sha}/statuses?per_page=100" \
+                       --jq "[.[] | select(.context == \"security-dashboard/G6/${prev}\")][0] // empty" 2>/dev/null) || g6=""
+                state=$(jq -r '.state // empty' <<<"${g6:-null}")
+                desc=$(jq -r '.description // ""' <<<"${g6:-null}")
+                [ "$state" = success ] || fail "${digest:0:19}… isn't verified in ${prev}: security-dashboard/G6/${prev} on ${deploy_sha:0:7} is '${state:-missing}' ${desc}"
+                detail="${TARGET_ENV} gets ${digest:0:19}… (built from ${source:0:7}), running in ${prev} since ${deploy_sha:0:7} with G6 verified (${desc})" ;;
+            esac
+          fi
+          detail="$detail; deploys only as a GitOps commit to deploy/${TARGET_ENV} by the release pipeline on main (Argo CD frappe-gates-demo-${TARGET_ENV})"
+          { echo "status=pass"; echo "detail=$detail"; echo "digest=$digest"; echo "source=$source"; echo "at=$at"; } >> "$GITHUB_OUTPUT"
+          echo "Releasing \`${IMAGE}@${digest}\` to **${TARGET_ENV}** (built from ${source:0:7}, ${KIND})" >> "$GITHUB_STEP_SUMMARY"
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.digest.outputs.status }}
+          DETAIL: ${{ steps.digest.outputs.detail || 'resolve did not run' }}
+          TOOL: git + GitHub commit statuses
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-promotion
+          path: reports/promotion/
+          if-no-files-found: ignore
+
+  provenance:
+    name: Deliver · signature, SBOM, SLSA provenance
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: provenance
+      OUT: reports/provenance
+      VERDICT_FILE: reports/provenance/verdict.json
+      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The provenance must name the commit that built this digest — a
+        # valid attestation for some other build of main isn't enough.
+        run: |
+          mkdir -p "$OUT"
+          fail=""
+          id=(--certificate-identity "$CERT_IDENTITY" --certificate-oidc-issuer "$CERT_ISSUER")
+          cosign verify "${id[@]}" "$REF" > "$OUT/signature.json" || fail="$fail signature"
+          cosign verify-attestation "${id[@]}" --type cyclonedx "$REF" > /dev/null || fail="$fail sbom-attestation"
+          if cosign verify-attestation "${id[@]}" --type slsaprovenance1 "$REF" > "$OUT/slsa.jsonl"; then
+            jq -r '.payload | @base64d | fromjson | .predicate.buildDefinition.resolvedDependencies[]?.digest.gitCommit // empty' "$OUT/slsa.jsonl" \
+              | grep -qx "$SOURCE_SHA" || fail="$fail slsa-commit-mismatch"
+          else
+            fail="$fail slsa-attestation"
+          fi
+          gh attestation verify "oci://${REF}" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/devsecops-pipeline.yml" --format json > "$OUT/gh-attestation.json" \
+            || fail="$fail gh-attestation"
+          if [ -z "$fail" ]; then
+            { echo "status=pass"; echo "detail=cosign signature + CycloneDX SBOM + SLSA v1 (commit ${SOURCE_SHA:0:7}) verified for devsecops-pipeline.yml@refs/heads/main; gh attestation verify passed"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "status=fail"; echo "detail=verification failed:${fail}"; } >> "$GITHUB_OUTPUT"
+          fi
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail || 'verification did not run' }}
+          TOOL: cosign 2.6.5 + gh attestation
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-provenance
+          path: reports/provenance/
+          if-no-files-found: ignore
+
+  evidence-check:
+    name: Deliver · pipeline evidence (G2 Control Gate passed)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: evidence-check
+      OUT: reports/evidence-check
+      VERDICT_FILE: reports/evidence-check/verdict.json
+      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: check
+        # The signed manifest is the pipeline's own record of this digest:
+        # built from its source commit, every control passed, the Control
+        # Gate (G2) recorded as passed. Dynamic tests aren't in it: they run
+        # after each deploy, in this workflow.
+        run: |
+          mkdir -p "$OUT"
+          if ! cosign verify-attestation --type "$EVIDENCE_TYPE" --certificate-identity "$CERT_IDENTITY" \
+                 --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > "$OUT/attestation.jsonl"; then
+            { echo "status=fail"; echo "detail=no verified evidence attestation ($EVIDENCE_TYPE) on ${DIGEST:0:19}"; } >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The newest attestation wins if the pipeline was re-run.
+          jq -s 'map(.payload | @base64d | fromjson | .predicate) | sort_by(.generated_at) | last' "$OUT/attestation.jsonl" > "$OUT/manifest.json"
+          problems=$(jq -r --arg sha "$SOURCE_SHA" --arg digest "$DIGEST" '[
+              (if .commit_sha != $sha then "built from \(.commit_sha[0:7]), not \($sha[0:7])" else empty end),
+              (if .artifact_digest != $digest then "manifest is for \(.artifact_digest)" else empty end),
+              (if .result != "pass" then "pipeline result \(.result) (\(.counts.fail) failed, \(.counts.missing) missing)" else empty end),
+              (if (.gates.G2.status // "") != "pass" or (.gates.G2.recorded // false) != true then "Control Gate (G2) not passed+recorded" else empty end)
+            ] | join("; ")' "$OUT/manifest.json")
+          if [ -z "$problems" ]; then
+            summary=$(jq -r '"\(.counts.pass) controls passed, \(.counts.skipped) skipped; Control Gate (G2) passed; run \(.run_url)"' "$OUT/manifest.json")
+            { echo "status=pass"; echo "detail=evidence attestation verified: $summary"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "status=fail"; echo "detail=evidence attestation verified but: $problems"; } >> "$GITHUB_OUTPUT"
+          fi
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail || 'check did not run' }}
+          TOOL: cosign verify-attestation
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-evidence-check
+          path: reports/evidence-check/
+          if-no-files-found: ignore
+
+  config:
+    name: Deliver · target config (deploy/${{ inputs.environment }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+      main-sha: ${{ steps.check.outputs.main_sha }}
+    env:
+      CONTROL: config
+      OUT: reports/config
+      VERDICT_FILE: reports/config/verdict.json
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+    steps:
+      # main as it is now, not this run's commit: the previous stage's
+      # deploy commit landed since. deploy checks nothing changed after.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: main
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - id: check
+        # Schema-valid (-strict rejects unknown fields; Rollout and
+        # AnalysisTemplate schemas from the CRDs catalog), no checkov
+        # failures, and the only change vs git is the image digest.
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          echo "main_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python3 .github/scripts/set_digest.py "$KUSTOMIZATION" "$DIGEST" || exit 0
+          kubectl kustomize "deploy/${TARGET_ENV}" > "$OUT/${TARGET_ENV}.yaml" || exit 0
+          grep -q "image: ${IMAGE}@${DIGEST}" "$OUT/${TARGET_ENV}.yaml" || { echo "::error::render does not reference the promoted digest"; exit 0; }
+          docker run --rm -v "$PWD/$OUT:/render:ro" "$KUBECONFORM" \
+            -strict -summary -output json -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            "/render/${TARGET_ENV}.yaml" > "$OUT/kubeconform.json"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          mkdir -p "$OUT/checkov"
+          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py < "$OUT/${TARGET_ENV}.yaml" > "$OUT/checkov/scan-view.yaml"
+          docker run --rm -v "$PWD/$OUT/checkov:/work" "$CHECKOV" -f /work/scan-view.yaml --framework kubernetes \
+            -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
+          echo "changed=$(git status --porcelain | awk '{print $2}' | grep -v '^reports/' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          RC: ${{ steps.check.outputs.rc }}
+          CHANGED: ${{ steps.check.outputs.changed }}
+          TOOL: kubeconform 0.8.0 + checkov 3.3.20
+        run: |
+          rc=0
+          CONTROL=config-schema OUTPUT=schema VERDICT_FILE="$OUT/kubeconform.verdict.json" \
+            python3 .github/scripts/verdict.py kubeconform "$OUT/kubeconform.json" || rc=1
+          CONTROL=config-checkov OUTPUT=checkov VERDICT_FILE="$OUT/checkov.verdict.json" \
+            python3 .github/scripts/verdict.py checkov "$OUT/checkov/results_json.json" || rc=1
+          status=$([ $rc = 0 ] && echo pass || echo fail)
+          detail="$(jq -r .detail "$OUT/kubeconform.verdict.json" 2>/dev/null) | checkov: $(jq -r .detail "$OUT/checkov.verdict.json" 2>/dev/null)"
+          python3 .github/scripts/verdict.py result "$status" "$detail"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-config
+          path: reports/config/
+          if-no-files-found: ignore
+
+  previous-env-tests:
+    name: Deliver · tests passed in the previous environment
+    # staging needs dev's G3 for this digest, prod needs staging's. The
+    # previous environment's stage attested its release record (with the
+    # G3 it ran against the deployed digest) to the digest, signed by this
+    # workflow on main: a record nobody can write by hand.
+    needs: resolve
+    if: inputs.environment != 'dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: previous-env-tests
+      OUT: reports/previous-env-tests
+      VERDICT_FILE: reports/previous-env-tests/verdict.json
+      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: check
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          prev=$([ "$TARGET_ENV" = staging ] && echo dev || echo staging)
+          res() { { echo "status=$1"; echo "detail=$2"; } >> "$GITHUB_OUTPUT"; exit 0; }
+          [ "$KIND" != rollback ] || res skipped "rollback to a digest ${TARGET_ENV} already ran: it passed ${prev}'s tests when it was first released"
+          cosign verify-attestation --type "$RELEASE_EVIDENCE_TYPE" --certificate-identity-regexp "$RELEASE_IDENTITY_REGEXP" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > "$OUT/attestation.jsonl" 2> "$OUT/cosign.log" \
+            || res fail "no verified release record on ${DIGEST:0:19}…: it hasn't been deployed and tested in ${prev} by the release pipeline"
+          # The newest record for the previous environment wins (a re-test).
+          jq -s --arg env "$prev" 'map(.payload | @base64d | fromjson | .predicate | select(.environment == $env))
+            | sort_by(.generated_at) | last // {}' "$OUT/attestation.jsonl" > "$OUT/record.json"
+          g3=$(jq -r '.gates.G3.status // empty' "$OUT/record.json")
+          run=$(jq -r '.run_url // empty' "$OUT/record.json")
+          [ -n "$g3" ] || res fail "no ${prev} release record with a G3 on ${DIGEST:0:19}…: release it to ${prev} and let its tests finish"
+          criteria=$(jq -r '[.gates.G3.criteria | to_entries[] | "\(.key) \(.value)"] | join(", ")' "$OUT/record.json")
+          [ "$g3" = pass ] && [ "$(jq -r '.gates.G3.recorded' "$OUT/record.json")" = true ] \
+            || res fail "G3 in ${prev} for this digest: ${g3} (${criteria}) — ${run}"
+          { echo "### Tests in ${prev} for this digest"
+            echo
+            echo "G3 **passed** against the deployed ${prev} environment — [release record](${run})"
+            echo
+            echo "| control | status | detail |"
+            echo "|---|---|---|"
+            jq -r '.controls[]? | select(.stage == "test" or .stage == "monitor" or .stage == "R5-test") | "| `\(.control)` | \(.status) | \(.detail | gsub("[|\n]"; " ")) |"' "$OUT/record.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+          res pass "G3 passed in ${prev} for this digest (${criteria}) — ${run}"
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail || 'check did not run' }}
+          TOOL: cosign verify-attestation (release record)
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-previous-env-tests
+          path: reports/previous-env-tests/
+          if-no-files-found: ignore
+
+  # ── Release: the candidate's records, and prod's approval — the
+  #    `release-approval` environment review. Records run in the Deliver
+  #    wave; prod's approval waits for all of them. ────────────────────────
+  release-notes:
+    name: Release · release notes
+    # What the approver approves: every change between the source running
+    # in this environment now and the one being released, in the run
+    # summary (read before approving) and as evidence.
+    needs: resolve
+    if: inputs.environment != 'dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: release-notes
+      OUT: reports/release-notes
+      VERDICT_FILE: reports/release-notes/verdict.json
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: notes
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          git fetch -q origin main
+          notes="$OUT/release-notes.md"
+          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          deploy_sha=$(git log -1 --format=%H origin/main -- "$KUSTOMIZATION")
+          current=$(git log -1 --format='%(trailers:key=Source-Commit,valueonly)' "$deploy_sha" | head -1 | tr -d '[:space:]')
+          running=$(git show "${deploy_sha}:${KUSTOMIZATION}" | sed -nE 's/^    digest: (sha256:[0-9a-f]{64})$/\1/p')
+          {
+            echo "## Release notes: ${TARGET_ENV} (${KIND})"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Deploying | \`${DIGEST}\` built from [${SOURCE_SHA:0:7}](${repo_url}/commit/${SOURCE_SHA}) |"
+            echo "| Replacing | \`${running:-nothing}\`${current:+ built from [${current:0:7}](${repo_url}/commit/${current})} |"
+            echo
+          } > "$notes"
+          range=""
+          if [ -z "$current" ] || ! git cat-file -e "${current}^{commit}" 2>/dev/null; then
+            echo "First release to ${TARGET_ENV} by the release pipeline: the changes below are the last 30 up to ${SOURCE_SHA:0:7}." >> "$notes"
+            range="$SOURCE_SHA"
+          elif [ "$current" = "$SOURCE_SHA" ]; then
+            echo "No code changes: the source ${TARGET_ENV} runs (${SOURCE_SHA:0:7}) is deployed again." >> "$notes"
+          elif git merge-base --is-ancestor "$current" "$SOURCE_SHA"; then
+            range="${current}..${SOURCE_SHA}"
+          else
+            echo "**Going back in history: ${SOURCE_SHA:0:7} doesn't contain ${current:0:7}.** The changes below leave ${TARGET_ENV}." >> "$notes"
+            range="${SOURCE_SHA}..${current}"
+          fi
+          prs=0; commits=0
+          if [ -n "$range" ]; then
+            echo -e "\n### Pull requests\n" >> "$notes"
+            for m in $(git rev-list --merges --first-parent --max-count=30 "$range"); do
+              if [[ "$(git show -s --format=%s "$m")" =~ ^Merge\ pull\ request\ \#([0-9]+) ]]; then
+                n=${BASH_REMATCH[1]}
+                echo "- [#${n}](${repo_url}/pull/${n}) $(git show -s --format=%b "$m" | sed -n 1p)" >> "$notes"
+                prs=$((prs + 1))
+              fi
+            done
+            [ "$prs" -gt 0 ] || echo "_none_" >> "$notes"
+            # Deploy commits only move digests between environments.
+            echo -e "\n### Commits\n" >> "$notes"
+            git log --no-merges --invert-grep --grep='^deploy(' --max-count=30 --format="- [%h](${repo_url}/commit/%H) %s (%an)" "$range" >> "$notes"
+            commits=$(git log --no-merges --invert-grep --grep='^deploy(' --format=%H "$range" | wc -l)
+          fi
+          cat "$notes" >> "$GITHUB_STEP_SUMMARY"
+          { echo "status=pass"
+            echo "detail=release notes for ${TARGET_ENV}: ${prs} pull request(s), ${commits} commit(s) since ${current:0:7}${current:-no earlier release} (run summary; release-notes.md)"; } >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.notes.outputs.status }}
+          DETAIL: ${{ steps.notes.outputs.detail || 'release notes were not generated' }}
+          TOOL: git log (deploy trailers)
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-release-notes
+          path: reports/release-notes/
+          if-no-files-found: ignore
+
+  rollback-plan:
+    name: Release · rollback plan
+    # What a failed deploy goes back to: the digest the environment runs
+    # now (for a redeploy of that digest, the target its deploy recorded).
+    # The deploy commit records it (Rollback-Digest/-Source) and kind
+    # rollback redeploys it. It must still verify and pull, or it's no plan.
+    # The digest running now is read from the overlay's own deploy commit
+    # when that commit is a release-pipeline deploy, and from the overlay
+    # itself when it is not (a hand-written or hand-edited overlay, and every
+    # environment's first release) — the environment runs what the file pins
+    # either way, and a rollback restores exactly that. An unverifiable or
+    # unpullable digest fails the gate in both paths.
+    # Argo Rollouts already aborts a canary that fails its analysis; this
+    # is for a problem found after the rollout completed.
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+      digest: ${{ steps.check.outputs.digest }}
+      source: ${{ steps.check.outputs.source }}
+    env:
+      CONTROL: rollback-plan
+      OUT: reports/rollback-plan
+      VERDICT_FILE: reports/rollback-plan/verdict.json
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: check
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          git fetch -q origin main
+          res() { { echo "status=$1"; echo "detail=$2"; } >> "$GITHUB_OUTPUT"; exit 0; }
+          deploy_sha=$(git log -1 --format=%H origin/main -- "$KUSTOMIZATION")
+          trailer() { git log -1 --format="%(trailers:key=$1,valueonly)" "$deploy_sha" | head -1 | tr -d '[:space:]'; }
+          running=$(git show "${deploy_sha}:${KUSTOMIZATION}" | sed -nE 's/^    digest: (sha256:[0-9a-f]{64})$/\1/p')
+          if [ "$(trailer Environment)" = "$TARGET_ENV" ] && [ "$(trailer Image-Digest)" = "$running" ] && [ -n "$(trailer Source-Commit)" ]; then
+            # The commit that last touched the overlay is this environment's
+            # own deploy commit: its trailers name the digest running there,
+            # and — when that already is this release's digest — the digest
+            # before it.
+            if [ "$running" != "$DIGEST" ]; then
+              target=$running; source=$(trailer Source-Commit)
+            else
+              target=$(trailer Rollback-Digest); source=$(trailer Rollback-Source)
+              [ -n "$target" ] || res skipped "${DIGEST:0:19}… already runs in ${TARGET_ENV} and its deploy ${deploy_sha:0:7} recorded no earlier digest"
+            fi
+          else
+            # No release-pipeline deploy of this environment on record, so no
+            # trailers to read: the overlay was last written by a human commit
+            # (every environment's first release, or a hand-edited overlay).
+            # dev and staging may have no earlier deploy to return to — gate-g5
+            # allows the criterion to be skipped there. prod must have one: what
+            # it runs is the digest pinned in the overlay (Argo syncs that file),
+            # and a rollback restores exactly that, so verify it as the target.
+            # The check below is unchanged — cosign and the registry still decide.
+            [ "$TARGET_ENV" != prod ] \
+              || [ -n "$running" ] \
+              || res fail "${KUSTOMIZATION} pins no image digest (last changed by ${deploy_sha:0:7}): ${TARGET_ENV} runs an unpinned image, so there is nothing to roll back to"
+            if [ "$TARGET_ENV" != prod ]; then
+              res skipped "${TARGET_ENV} has no deploy by the release pipeline yet (${KUSTOMIZATION} last changed by ${deploy_sha:0:7}): nothing to roll back to"
+            fi
+            [ "$running" != "$DIGEST" ] || res skipped "${DIGEST:0:19}… already runs in ${TARGET_ENV} and no earlier deploy is recorded (${KUSTOMIZATION} last changed by ${deploy_sha:0:7}): nothing to roll back to"
+            target=$running; source=""
+            echo "no ${TARGET_ENV} deploy by the release pipeline is on record (${KUSTOMIZATION} last changed by ${deploy_sha:0:7}); taking the digest pinned there as the rollback target" >&2
+          fi
+          ref="${IMAGE}@${target}"
+          cosign verify --certificate-identity "$CERT_IDENTITY" --certificate-oidc-issuer "$CERT_ISSUER" "$ref" > "$OUT/signature.json" 2> "$OUT/cosign.log" \
+            || res fail "rollback target ${target:0:19}… no longer verifies (${CERT_IDENTITY##*/}): $(tail -1 "$OUT/cosign.log")"
+          skopeo inspect --raw "docker://${ref}" > "$OUT/manifest.json" 2> "$OUT/skopeo.log" \
+            || res fail "rollback target ${target:0:19}… can't be pulled: $(tail -1 "$OUT/skopeo.log")"
+          { echo "digest=$target"; echo "source=$source"; } >> "$GITHUB_OUTPUT"
+          built=""
+          [ -z "$source" ] || built=" (built from ${source:0:7})"
+          gates=""
+          [ "$TARGET_ENV" != prod ] || gates=", approval included"
+          { echo "### Rollback plan (${TARGET_ENV})"
+            echo
+            echo "If ${TARGET_ENV} misbehaves after this deploy: Actions → devsecops-release → start \`${TARGET_ENV}\`, kind \`rollback\`."
+            echo "That redeploys \`${target}\`${built} through the same gates${gates}."
+            [ -n "$source" ] || echo "It was pinned by \`${deploy_sha:0:7}\`, which is not a release-pipeline deploy, so the registry — not a commit trailer — is what verified it."; } >> "$GITHUB_STEP_SUMMARY"
+          res pass "rollback target ${target:0:19}…${built}: signature verified, image pullable; recorded on the deploy commit"
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail || 'check did not run' }}
+          TOOL: cosign verify + skopeo
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-rollback-plan
+          path: reports/rollback-plan/
+          if-no-files-found: ignore
+
+  approve-prod:
+    name: Release · approval gate · prod
+    # Prod's approval: a GitHub environment review by someone who neither
+    # started this release nor authored the change (approvals.sh enforces
+    # that; the environment enforces that a review happens at all). This is
+    # the only difference between prod and dev/staging, which run the same
+    # jobs and gates without it.
+    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan]
+    if: ${{ !cancelled() && inputs.environment == 'prod' }}
+    environment: release-approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: approve-prod
+      OUT: reports/approve-prod
+      VERDICT_FILE: reports/approve-prod/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - id: sod
+        name: Separation of duties
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
+          ALLOW_SELF_APPROVAL: ${{ inputs.allow-self-approval }}
+        run: bash .github/scripts/approvals.sh release-approval
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.sod.outcome == 'success' && 'pass' || 'fail' }}
+          DETAIL: ${{ steps.sod.outputs.detail || 'approval check did not run' }}
+          TOOL: GitHub environment review (release-approval)
+        run: |
+          mkdir -p "$OUT"
+          python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-approve-prod
+          path: reports/approve-prod/
+          if-no-files-found: ignore
+
+  gate-g5:
+    name: G5 deployment gate
+    # Before the deploy commit: nothing reaches an environment unless G5
+    # passed for it. Prod also needs its approval first (approve-prod);
+    # dev and staging have no approval step, so theirs is skipped.
+    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-prod]
+    if: >-
+      always() && needs.resolve.result == 'success' &&
+      (needs.approve-prod.result == 'success' || (inputs.environment != 'prod' && needs.approve-prod.result == 'skipped'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: ./.github/actions/gate
+        with:
+          gate: G5
+          profile: ${{ inputs.environment }}
+          name-suffix: -${{ inputs.environment }}
+          needs: ${{ toJSON(needs) }}
+          subject: ${{ needs.resolve.outputs.digest }}
+          commit-sha: ${{ needs.resolve.outputs.source-sha }}
+          artifact-digest: ${{ needs.resolve.outputs.digest }}
+          environment: ${{ inputs.environment }}
+          started-at: ${{ needs.resolve.outputs.started-at }}
+          # dev and staging may have no earlier deploy to return to; prod must
+          # have one (its overlay always pins the digest it runs, and
+          # rollback-plan verifies that digest in the registry). A rollback's
+          # target was tested when first released.
+          allow-skipped: >-
+            ${{ inputs.environment != 'prod' && 'rollback_plan_ready' || '' }},${{ inputs.kind == 'rollback' && 'previous_environment_tests_passed' || '' }}
+
+  # ── Deploy: the GitOps commit; G6 admission happens on the cluster. ─────
+  deploy:
+    name: Deploy · GitOps commit to deploy/${{ inputs.environment }}
+    # The only write path to the cluster: a commit on main that Argo CD
+    # syncs. [skip ci] + paths-ignore keep it from re-running the pipeline.
+    needs: [resolve, config, gate-g5, rollback-plan, approve-prod]
+    # A status function is required: approve-prod is skipped for dev and
+    # staging, and the implicit success() also fails on a skipped ancestor,
+    # which would skip the deploy for every non-prod environment.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.gate-g5.result == 'success' }}
+    # One deploy per environment at a time, across release runs. A newer
+    # run waiting here replaces an older one that's still waiting.
+    concurrency:
+      group: devsecops-deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # the push authenticates with the GitOps deploy key, not the run token
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+      gitops-sha: ${{ steps.commit.outputs.gitops_sha }}
+    env:
+      CONTROL: deploy
+      OUT: reports/deploy
+      VERDICT_FILE: reports/deploy/verdict.json
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
+      VERIFIED_SHA: ${{ needs.config.outputs.main-sha }}
+      ROLLBACK_DIGEST: ${{ needs.rollback-plan.outputs.digest }}
+      ROLLBACK_SOURCE: ${{ needs.rollback-plan.outputs.source }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # main's ruleset rejects the run token; the deploy key below pushes
+          fetch-depth: 0
+      - id: key
+        name: GitOps deploy key — main is protected, the run token cannot push there
+        # main requires every change to arrive through a pull request, and
+        # GitHub does not let github-actions (the run token) bypass a
+        # repository ruleset. The deploy commit is therefore pushed over SSH
+        # with the pipeline's deploy key, which is the ruleset's bypass actor
+        # (Settings → Rules → Branch-protect-gith → Bypass list). Humans are
+        # unaffected: their pushes to main still need a reviewed PR.
+        env:
+          GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITOPS_DEPLOY_KEY:-}" ]; then
+            echo "::error::secret GITOPS_DEPLOY_KEY is not set, so the deploy commit cannot reach the protected main branch. Add the release pipeline's deploy key as that repository secret (README → 'The deploy key that lets the pipeline push to main')."
+            exit 1
+          fi
+          ssh_dir="$RUNNER_TEMP/gitops-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$GITOPS_DEPLOY_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          # GitHub's published host key, pinned: nothing is learned at run time.
+          mkdir -p ~/.ssh
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          git config --global core.sshCommand "ssh -i $ssh_dir/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          git ls-remote --exit-code origin refs/heads/main > /dev/null \
+            || { echo "::error::the GitOps deploy key cannot reach ${GITHUB_REPOSITORY}: revoked, installed on another repository, or read-only"; exit 1; }
+      - id: commit
+        # Pushes over the SSH remote the step above installed.
+        # On main as it is now (another release may have pushed since
+        # config verified it), but only if what config verified — the base
+        # and this environment's overlay — hasn't changed since. A push
+        # that loses the race to another environment's deploy commit is
+        # rebuilt on the new main and retried.
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The trailers are what the next environment's resolve reads, and
+          # Rollback-* what this environment's next rollback redeploys.
+          trailers=(--trailer "Environment: ${TARGET_ENV}" --trailer "Image-Digest: ${DIGEST}" --trailer "Source-Commit: ${SOURCE_SHA}")
+          # Rollback-Source is the commit that built the rollback target, which
+          # is unknown when rollback-plan had to read the digest off the overlay
+          # (no pipeline deploy on record) — record the digest alone then.
+          [ -z "$ROLLBACK_DIGEST" ] || trailers+=(--trailer "Rollback-Digest: ${ROLLBACK_DIGEST}")
+          [ -z "$ROLLBACK_SOURCE" ] || trailers+=(--trailer "Rollback-Source: ${ROLLBACK_SOURCE}")
+          kind=$([ "$KIND" = planned ] || echo " ${KIND}")
+          PUSH_LOG="$RUNNER_TEMP/push-error.log"
+          for attempt in 1 2 3; do
+            git fetch -q origin main
+            if ! git diff --quiet "$VERIFIED_SHA" origin/main -- deploy/base "deploy/${TARGET_ENV}"; then
+              echo "::error::deploy/base or deploy/${TARGET_ENV} changed on main since config verified it at ${VERIFIED_SHA:0:7}; start a new run"; exit 1
+            fi
+            git checkout -q -B main origin/main
+            python3 .github/scripts/set_digest.py "$KUSTOMIZATION" "$DIGEST"
+            git add "$KUSTOMIZATION"
+            if git diff --cached --quiet; then
+              # Idempotent re-deploy: this environment already pins this
+              # digest (a re-run of the same release, or a promotion of what
+              # it already runs). There is nothing to commit, and an empty
+              # `git commit` would fail the job — so carry forward the commit
+              # that put this digest there, which is what post-deploy and the
+              # deployment event then refer to.
+              sha=$(git log -1 --format=%H origin/main -- "$KUSTOMIZATION")
+              echo "deploy/${TARGET_ENV} already pins ${DIGEST:0:19}… (${sha:0:7}) — nothing to commit"
+              echo "gitops_sha=$sha" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git commit -q -m "deploy(${TARGET_ENV}): frappe-gates-demo ${DIGEST:7:12}${kind} [skip ci]" \
+              -m "Released ${IMAGE}@${DIGEST} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              "${trailers[@]}"
+            if git push -q origin HEAD:main 2>"$PUSH_LOG"; then break; fi
+            if [ "$attempt" -ge 3 ]; then
+              reason=$(grep -m1 -E '^remote: error:' "$PUSH_LOG" | sed 's/^remote: error: //' || true)
+              echo "::error::push to main failed 3 times${reason:+: ${reason}}"
+              # GH013 = the ref is protected by a repository ruleset. Name the
+              # fix instead of leaving a bare failure in the log.
+              if grep -qE 'GH013|rule violation' "$PUSH_LOG"; then
+                echo "::error::refs/heads/main is protected by a repository ruleset, which rejects this GitOps deploy commit. Add a bypass for the bot that pushes it (Settings -> Rules -> the main ruleset -> Bypass list -> github-actions[bot], mode 'always'); human pushes still require a pull request."
+              fi
+              mkdir -p "$OUT"
+              { echo "push to main rejected by the server (last attempt):"
+                grep -E '^remote:|^ ! \[' "$PUSH_LOG" | head -4
+              } > "$OUT/push-error.txt"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "gitops_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          SHA: ${{ steps.commit.outputs.gitops_sha }}
+          TOOL: git (GitOps) → Argo CD
+        run: |
+          mkdir -p "$OUT"
+          if [ -n "$SHA" ]; then
+            python3 .github/scripts/verdict.py result pass "GitOps commit ${SHA:0:7} on main → Argo CD app frappe-gates-demo-${TARGET_ENV} (automated sync)"
+          else
+            # Carry the server's own words into the deploy record, so the
+            # dashboard and the evidence bundle say why, not just that.
+            reason=$(grep -m1 -E '^remote: error:' "$OUT/push-error.txt" 2>/dev/null | sed 's/^.*error: //' | tr -d '\r' || true)
+            python3 .github/scripts/verdict.py result fail "GitOps commit/push to main failed${reason:+ — ${reason}}"
+          fi
+      - name: Build deployment-event
+        if: steps.commit.outputs.gitops_sha != ''
+        env:
+          GITOPS_SHA: ${{ steps.commit.outputs.gitops_sha }}
+        # in_progress: the commit is only the start. Argo CD notifications
+        # report the sync/canary outcome under the same external_id
+        # (deploy-<dashboard.environment>-<revision>). commit_sha is the
+        # commit that built the digest, so lead time runs from there.
+        run: |
+          mkdir -p "$RUNNER_TEMP/deployment-event"
+          jq -n \
+            --arg id "deploy-${TARGET_ENV}-${GITOPS_SHA}" --arg env "$TARGET_ENV" --arg sha "$SOURCE_SHA" \
+            --arg digest "$DIGEST" --arg commit_at "$(git show -s --format=%cI "$SOURCE_SHA")" \
+            --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg kind "$KIND" \
+            --arg run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{external_id: $id, environment: $env, commit_sha: $sha,
+              artifact_digest: $digest, commit_at: $commit_at, started_at: $started,
+              status: "in_progress", kind: $kind, via_approved_path: true, break_glass: false,
+              run_url: $run}' | tee "$RUNNER_TEMP/deployment-event/deployment.json"
+          cp "$RUNNER_TEMP/deployment-event/deployment.json" "$OUT/"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.commit.outputs.gitops_sha != ''
+        with:
+          name: deployment-event-${{ inputs.environment }}
+          path: ${{ runner.temp }}/deployment-event/deployment.json
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-deploy
+          path: reports/deploy/
+          if-no-files-found: ignore
+
+  post-deploy:
+    name: Deploy · verify the rollout (G6 status)
+    # Argo CD reports G6 (sync, canary analysis, Kyverno admission) to the
+    # dashboard; the dashboard mirrors it as commit status
+    # `security-dashboard/G6/<env>` on the deploy commit. A GitHub-hosted
+    # runner can't see the cluster, so this is how the release learns the
+    # outcome.
+    needs: [deploy]
+    # Same as deploy: the skipped approve-prod ancestor must not skip this job.
+    if: ${{ !cancelled() && needs.deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      statuses: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: post-deploy
+      OUT: reports/post-deploy
+      VERDICT_FILE: reports/post-deploy/verdict.json
+      GITOPS_SHA: ${{ needs.deploy.outputs.gitops-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          context="security-dashboard/G6/${TARGET_ENV}"
+          for _ in $(seq 90); do
+            s=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITOPS_SHA}/statuses?per_page=100" \
+                  --jq "[.[] | select(.context == \"${context}\")][0] // empty" 2>/dev/null)
+            state=$(jq -r '.state // empty' <<<"${s:-null}")
+            desc=$(jq -r '.description // ""' <<<"${s:-null}")
+            if [ "$state" = success ] || [ "$state" = failure ] || [ "$state" = error ]; then
+              jq . <<<"$s" > "$OUT/g6-status.json"
+              { echo "status=$([ "$state" = success ] && echo pass || echo fail)"
+                echo "detail=G6 ${state}: ${desc} ($(jq -r '.target_url // ""' <<<"$s"))"; } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 20
+          done
+          { echo "status=fail"; echo "detail=no ${context} status on ${GITOPS_SHA:0:7} within 30 minutes (Argo CD sync or notification didn't reach the dashboard)"; } >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.wait.outputs.status }}
+          DETAIL: ${{ steps.wait.outputs.detail || 'wait did not run' }}
+          TOOL: security dashboard (Argo CD notifications)
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-post-deploy
+          path: reports/post-deploy/
+          if-no-files-found: ignore
+
+  # ── Test: one job per control against the deployed environment; the
+  #    G3/G6 gate after them (plus prod's health watch) decides whether
+  #    the stage — and promotion to the next environment — may proceed. ──
+  # Like the pipeline's control jobs, each test is its own job, report
+  # (`report-<env>-<control>`) and verdict, and G3/G6 below has a criterion
+  # for each:
+  #   dev      functional (smoke, integration) · regression · security
+  #            (authenticated, DAST nuclei, dependency re-check)
+  #   staging  functional (smoke, end-to-end) · regression · performance
+  #            (k6) · security (authenticated, DAST nuclei, TLS testssl.sh)
+  #   prod     smoke (read-only: no test users, no writes) · health watch
+  # The cluster-facing ones run on the environment test runner (README:
+  # "Environment test runner"; a GitHub-hosted runner can't reach the
+  # cluster): its environment supplies KUBECONFIG, the env-tester service
+  # account, which may port-forward everywhere but exec (to create test
+  # users) only in dev and staging. The repo holds no cluster credential.
+  # tests/env/env-up.sh gives every job its own ports, proxy and test
+  # users, so they can run side by side.
+
+  smoke:
+    name: Test · functional · smoke
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' }}
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-smoke
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: frappe-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: smoke
+      OUT: reports
+      VERDICT_FILE: reports/smoke/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        run: bash tests/env/env-up.sh
+      - name: smoke tests
+        id: run
+        if: steps.up.outcome == 'success'
+        run: bash tests/env/live-suite.sh smoke tests/live -m smoke
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          LABEL: "tests/live -m smoke against ${{ inputs.environment }} (read-only: no test users, no writes)"
+          TOOL: pytest + requests
+        run: python3 .github/scripts/verdict.py tests "$OUT/smoke/junit.xml"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-smoke
+          path: reports/smoke/
+          if-no-files-found: ignore
+
+  integration:
+    name: Test · functional · integration
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'dev' }}
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-integration
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: frappe-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: integration
+      OUT: reports
+      VERDICT_FILE: reports/integration/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        env:
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: Test · functional · integration
+        id: run
+        if: steps.up.outcome == 'success'
+        run: bash tests/env/live-suite.sh integration tests/live/test_integration.py
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          LABEL: "tests/live/test_integration.py against ${{ inputs.environment }} (TLS ingress, sessions, auth, API and pages on one database)"
+          TOOL: pytest + requests
+        run: python3 .github/scripts/verdict.py tests "$OUT/integration/junit.xml"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-integration
+          path: reports/integration/
+          if-no-files-found: ignore
+
+  e2e:
+    name: Test · functional · end-to-end
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'staging' }}
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-e2e
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: frappe-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: e2e
+      OUT: reports
+      VERDICT_FILE: reports/e2e/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        env:
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: Test · functional · end-to-end
+        id: run
+        if: steps.up.outcome == 'success'
+        run: bash tests/env/live-suite.sh e2e tests/live/test_e2e.py
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          LABEL: "tests/live/test_e2e.py against ${{ inputs.environment }} (user journeys through the pages and their forms)"
+          TOOL: pytest + requests
+        run: python3 .github/scripts/verdict.py tests "$OUT/e2e/junit.xml"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-e2e
+          path: reports/e2e/
+          if-no-files-found: ignore
+
+  regression:
+    name: Test · regression
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment != 'prod' }}
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-regression
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: frappe-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: regression
+      OUT: reports
+      VERDICT_FILE: reports/regression/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        env:
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: Test · regression
+        id: run
+        if: steps.up.outcome == 'success'
+        run: bash tests/env/live-suite.sh regression tests/live/test_regression.py
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          LABEL: "tests/live/test_regression.py against ${{ inputs.environment }} (fixed or decided behaviour that must not come back)"
+          TOOL: pytest + requests
+        run: python3 .github/scripts/verdict.py tests "$OUT/regression/junit.xml"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-regression
+          path: reports/regression/
+          if-no-files-found: ignore
+
+  security-tests:
+    name: Test · security · authenticated (OWASP Top 10)
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment != 'prod' }}
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-security-tests
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: frappe-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: security-tests
+      OUT: reports
+      VERDICT_FILE: reports/security-tests/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        env:
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: Test · security · authenticated (OWASP Top 10)
+        id: run
+        if: steps.up.outcome == 'success'
+        run: bash tests/env/live-suite.sh security-tests tests/live/test_security.py
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          LABEL: "tests/live/test_security.py against ${{ inputs.environment }} (OWASP Top 10 with two users: IDOR, CSRF, sessions, headers, injection)"
+          TOOL: pytest + requests
+        run: python3 .github/scripts/verdict.py tests "$OUT/security-tests/junit.xml"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-security-tests
+          path: reports/security-tests/
+          if-no-files-found: ignore
+
+  performance:
+    name: Test · performance (k6 load)
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'staging' }}
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-performance
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: frappe-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: performance
+      OUT: reports
+      VERDICT_FILE: reports/performance/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        env:
+          TEST_USERS: true
+        run: bash tests/env/env-up.sh
+      - name: k6 load
+        if: steps.up.outcome == 'success'
+        run: |
+          mkdir -p "$OUT/performance" && chmod 777 "$OUT/performance"
+          # shellcheck source=/dev/null
+          set -a; . "$RUNNER_TEMP/env-tests.env"; set +a
+          docker run --rm --network host --user "$(id -u):$(id -g)" \
+            -v "$PWD/tests/perf:/perf:ro" -v "$PWD/$OUT/performance:/out" -v "$SSL_CERT_FILE:/ca.crt:ro" \
+            -e SSL_CERT_FILE=/ca.crt -e BASE_URL -e USER_A -e PASSWORD_A -e SUMMARY_OUT=/out/k6-summary.json \
+            "$K6" run --quiet /perf/load.js || true
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          TOOL: k6 2.3.0 (10 VUs, 30 s) against staging
+        run: python3 .github/scripts/verdict.py k6 "$OUT/performance/k6-summary.json"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-performance
+          path: reports/performance/
+          if-no-files-found: ignore
+
+  dast-nuclei:
+    name: Test · security · DAST (nuclei)
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment != 'prod' }}
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-dast-nuclei
+      cancel-in-progress: false
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: frappe-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: dast-nuclei
+      OUT: reports
+      VERDICT_FILE: reports/dast-nuclei/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        run: bash tests/env/env-up.sh
+      - name: nuclei
+        id: run
+        if: steps.up.outcome == 'success'
+        # Templates pinned to a release commit, not "latest at scan time",
+        # so the same deployment gets the same verdict on a re-run.
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT/dast-nuclei" && chmod 777 "$OUT/dast-nuclei"
+          rm -rf "$RUNNER_TEMP/templates"
+          umask 022   # the nuclei container reads them as another uid
+          git clone -q --depth 1 --branch "$NUCLEI_TEMPLATES" https://github.com/projectdiscovery/nuclei-templates.git "$RUNNER_TEMP/templates"
+          got=$(git -C "$RUNNER_TEMP/templates" rev-parse HEAD)
+          [ "$got" = "$NUCLEI_TEMPLATES_COMMIT" ] || { echo "::error::nuclei-templates $NUCLEI_TEMPLATES is $got, pinned $NUCLEI_TEMPLATES_COMMIT"; exit 0; }
+          touch "$OUT/dast-nuclei/nuclei.jsonl"
+          docker run --rm --network host -v "$RUNNER_TEMP/templates:/templates:ro" -v "$PWD/$OUT/dast-nuclei:/out" "$NUCLEI" \
+            -u "$BASE_URL" -t /templates -disable-update-check -duc -exclude-tags dos,fuzz,intrusive,osint \
+            -rate-limit 100 -timeout 5 -no-color -silent -jsonl -o /out/nuclei.jsonl > "$OUT/dast-nuclei/nuclei.log" 2>&1
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          TOOL: nuclei 3.11.1 against ${{ inputs.environment }}
+          TEMPLATES: ${{ env.NUCLEI_TEMPLATES }}
+        run: python3 .github/scripts/verdict.py nuclei "$OUT/dast-nuclei/nuclei.jsonl"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-dast-nuclei
+          path: reports/dast-nuclei/
+          if-no-files-found: ignore
+
+  dast-tls:
+    name: Test · security · TLS (testssl.sh)
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'staging' }}
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-dast-tls
+      cancel-in-progress: false
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: frappe-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: dast-tls
+      OUT: reports
+      VERDICT_FILE: reports/dast-tls/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        run: bash tests/env/env-up.sh
+      - name: testssl.sh
+        if: steps.up.outcome == 'success'
+        # The TLS endpoint is the runner's stand-in ingress (tests/env/Caddyfile).
+        run: |
+          mkdir -p "$OUT/dast-tls" && chmod 777 "$OUT/dast-tls"
+          docker run --rm --network host -v "$PWD/$OUT/dast-tls:/out" -v "$ENV_CA:/ca.crt:ro" "$TESTSSL" \
+            --quiet --color 0 --warnings off --add-ca /ca.crt \
+            --jsonfile-pretty /out/testssl.json "$BASE_URL" > "$OUT/dast-tls/testssl.log" 2>&1 || true
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          TARGET_URL: ${{ env.BASE_URL }} (staging's stand-in ingress)
+          TOOL: testssl.sh 3.2.4 against staging
+        run: python3 .github/scripts/verdict.py testssl "$OUT/dast-tls/testssl.json"
+      - name: testssl.sh report
+        if: ${{ !cancelled() }}
+        run: python3 .github/scripts/findings.py native "$OUT/dast-tls/testssl.log"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-dast-tls
+          path: reports/dast-tls/
+          if-no-files-found: ignore
+
+  dependency-check:
+    name: Test · security · dependency re-check (trivy)
+    # The pipeline scanned these bytes when it built them; this scans the
+    # deployed digest again with today's vulnerability data, so a CVE
+    # published since the build is caught before staging. Reads only the
+    # registry, so a GitHub-hosted runner does.
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'dev' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: dependency-check
+      RISK_CONTROL: image-scan
+      OUT: reports
+      VERDICT_FILE: reports/dependency-check/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: trivy image (current vulnerability DB)
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        run: |
+          mkdir -p "$OUT/dependency-check" && chmod 777 "$OUT/dependency-check"
+          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            image --scanners vuln --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          TOOL: trivy 0.74.0 (deployed digest, current vulnerability DB)
+        run: python3 .github/scripts/verdict.py trivy "$OUT/dependency-check/trivy.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-dependency-check
+          path: reports/dependency-check/
+          if-no-files-found: ignore
+
+  # ── Monitor: golden signals on the new pods — the prod G6 criterion
+  #    (post_deploy_health_watch_green). G7/CONMON is continuous,
+  #    cluster-side (reporter + Wazuh → the dashboard), not a job here. ────
+  health-watch:
+    name: Monitor · health watch (probes, latency SLO, restarts)
+    # Monitoring after the rollout: the new pods keep answering /api/method/frappe_gates_demo.api.health
+    # within the latency SLO, and no container of the app restarts, for
+    # HEALTH_WATCH_SECONDS. Read-only, like prod's smoke tests.
+    needs: [resolve, post-deploy]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' && inputs.environment == 'prod' }}
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
+    concurrency:
+      group: devsecops-test-${{ inputs.environment }}-health-watch
+      cancel-in-progress: false
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      NS: frappe-gates-demo-${{ inputs.environment == 'staging' && 'stg' || inputs.environment }}
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      CONTROL: health-watch
+      OUT: reports
+      VERDICT_FILE: reports/health-watch/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reach ${{ inputs.environment }}
+        id: up
+        run: bash tests/env/env-up.sh
+      - name: health watch
+        if: steps.up.outcome == 'success'
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT/health-watch"
+          restarts() {
+            kubectl -n "$NS" get pods -l app=frappe-gates-demo -o json \
+              | jq -c '[.items[] | .metadata.name as $p | (.status.containerStatuses // [])[] | {key: "\($p)/\(.name)", value: .restartCount}] | from_entries'
+          }
+          before=$(restarts) || before='{}'
+          probes="$RUNNER_TEMP/probes.jsonl"
+          : > "$probes"
+          end=$((SECONDS + HEALTH_WATCH_SECONDS))
+          while [ "$SECONDS" -lt "$end" ]; do
+            at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            out=$(curl -sS -o /dev/null --max-time 5 --cacert "$ENV_CA" -w '%{http_code} %{time_total}' \
+                    "${BASE_URL}/api/method/frappe_gates_demo.api.health" 2>/dev/null) || true
+            code=${out%% *}; [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+            code=$((10#$code))
+            t=${out##* }; [[ "$t" =~ ^[0-9]+(\.[0-9]+)?$ ]] || t=0
+            jq -nc --argjson code "$code" --argjson t "$t" --arg at "$at" '{code: $code, ms: ($t * 1000 | round), at: $at}' >> "$probes"
+            sleep 10
+          done
+          after=$(restarts) || after='{}'
+          jq -s --argjson b "$before" --argjson a "$after" --argjson s "$HEALTH_WATCH_SECONDS" \
+            '{probes: ., seconds: $s, restarts_before: $b, restarts_after: $a}' "$probes" > "$OUT/health-watch/health.json"
+      - id: verdict
+        if: ${{ !cancelled() }}
+        env:
+          TOOL: curl /api/method/frappe_gates_demo.api.health every 10 s + kubectl restart counts
+        run: python3 .github/scripts/verdict.py health "$OUT/health-watch/health.json"
+      - name: Tear down
+        if: always()
+        run: bash tests/env/env-down.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-${{ inputs.environment }}-health-watch
+          path: reports/health-watch/
+          if-no-files-found: ignore
+
+  # ── G3/G6 test gate: the phase boundary to the next environment.
+  #    Every Test job (and prod's health watch) answers a criterion
+  #    (gate.py G3@<env> / G6@prod); one that should have run but was
+  #    skipped or failed fails the gate — the stage fails, staging/prod
+  #    promotion never starts, and on prod the rollback begins. ─────────────
+  test-gate:
+    name: Test gate · ${{ inputs.environment }} (G3 or G6 post-deploy)
+    # Every test job above answers a criterion (gate.py G3@<env>, G6@prod);
+    # one that should have run but was skipped or failed fails the gate,
+    # and with it every later stage (prod: the automatic rollback).
+    needs: [resolve, post-deploy, smoke, integration, e2e, regression, security-tests, performance, dast-nuclei, dast-tls,
+            dependency-check, health-watch]
+    if: ${{ !cancelled() && needs.post-deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: ./.github/actions/gate
+        with:
+          gate: ${{ inputs.environment == 'prod' && 'G6' || 'G3' }}
+          profile: ${{ inputs.environment }}
+          name-suffix: -${{ inputs.environment }}
+          needs: ${{ toJSON(needs) }}
+          subject: ${{ needs.resolve.outputs.digest }}
+          commit-sha: ${{ needs.resolve.outputs.source-sha }}
+          artifact-digest: ${{ needs.resolve.outputs.digest }}
+          environment: ${{ inputs.environment }}
+
+  release-evidence:
+    name: Release · record (attested)
+    needs: [resolve, provenance, evidence-check, config, previous-env-tests, release-notes, rollback-plan, approve-prod,
+            gate-g5, deploy, post-deploy, smoke, integration, e2e, regression, security-tests,
+            performance, dast-nuclei, dast-tls, dependency-check, health-watch, test-gate]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      DIGEST: ${{ needs.resolve.outputs.digest }}
+      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      REPORT_PREFIX: report-${{ inputs.environment }}-
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: report-${{ inputs.environment }}-*
+          path: ${{ runner.temp }}/in
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gate-*-${{ inputs.environment }}
+          path: ${{ runner.temp }}/in
+      - name: Bundle + hash manifest
+        env:
+          APPROVAL_RESULT: ${{ needs.approve-prod.result }}
+        run: |
+          set -euo pipefail
+          in="$RUNNER_TEMP/in"
+          case "$TARGET_ENV" in
+            dev)     controls="promotion,provenance,evidence-check,config,rollback-plan,deploy,post-deploy,smoke,integration,regression,security-tests,dast-nuclei,dependency-check" ;;
+            staging) controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,deploy,post-deploy,smoke,e2e,regression,security-tests,performance,dast-nuclei,dast-tls" ;;
+            prod)    controls="promotion,provenance,evidence-check,config,previous-env-tests,release-notes,rollback-plan,approve-prod,deploy,post-deploy,smoke,health-watch" ;;
+          esac
+          CONTROLS=$controls python3 .github/scripts/evidence.py "$in" release-evidence
+          jq --arg approval "$APPROVAL_RESULT" --arg env "$TARGET_ENV" \
+            '. + {environment: $env, approval_job: $approval}' \
+            release-evidence/manifest.json > "$RUNNER_TEMP/m.json" && mv "$RUNNER_TEMP/m.json" release-evidence/manifest.json
+          (cd release-evidence && find . -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-evidence-${{ inputs.environment }}
+          path: release-evidence/
+          retention-days: 90
+          if-no-files-found: error
+      - if: needs.deploy.result == 'success'
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - if: needs.deploy.result == 'success'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - if: needs.deploy.result == 'success'
+        name: Attest the release record to the image digest
+        run: |
+          set -euo pipefail
+          cosign attest --yes --type "$RELEASE_EVIDENCE_TYPE" --predicate release-evidence/manifest.json "$REF"
+          cosign verify-attestation --type "$RELEASE_EVIDENCE_TYPE" --certificate-identity-regexp "$RELEASE_IDENTITY_REGEXP" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > /dev/null
+          echo "Release record (${TARGET_ENV}) attested to ${REF} (${RELEASE_EVIDENCE_TYPE})" >> "$GITHUB_STEP_SUMMARY"

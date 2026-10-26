@@ -1,0 +1,19 @@
+# Coverage is measured around Frappe's own test runner (see
+# devsecops-pipeline.yml, job `unit-tests`): the source under test is the app,
+# never the framework, and the tests themselves are not "covered code".
+[run]
+source = frappe_gates_demo
+branch = False
+
+[report]
+omit =
+    */tests/*
+    */test_*.py
+    */__init__.py
+    */patches/*
+    */templates/*
+    */config/*
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError

@@ -1,0 +1,28 @@
+# staging: gets a digest that passed dev's Test phase, and nothing else.
+# Argo CD app `frappe-gates-demo-stg` syncs it with selfHeal.
+# The only automated edit is the image digest below (set_digest.py).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: frappe-gates-demo-stg
+
+resources:
+  - ../base
+
+patches:
+  - target: {kind: Rollout, name: frappe-gates-demo}
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target: {kind: AnalysisTemplate, name: frappe-gates-demo-canary-health}
+    patch: |
+      - op: replace
+        path: /spec/metrics/0/provider/web/url
+        value: http://frappe-gates-demo-canary.frappe-gates-demo-stg.svc/api/method/frappe_gates_demo.api.health
+
+images:
+  # Never a tag: admission (Kyverno) requires digests. Every environment
+  # starts at the digest prod already ran; promotion replaces it.
+  - name: frappe-gates-demo
+    newName: ghcr.io/usfali-ke/frappe-gates-demo
+    digest: sha256:72288e24c054855fbb6da2fe41332a6ec6f6b740365203b614130b70e67b31e7

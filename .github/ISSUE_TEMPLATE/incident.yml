@@ -1,0 +1,65 @@
+# Parsed by the security dashboard (incident metrics, change failure rate,
+# escaped defects, PIR tracking). Keep the field labels exactly as they
+# are. Labels: `pir-required` when a post-incident review is owed,
+# `pir-complete` once its actions are done.
+name: Incident
+description: Record a production incident
+title: "INC: "
+labels: [incident]
+body:
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - sev1 — critical, customer-facing outage or data exposure
+        - sev2 — major degradation, no workaround
+        - sev3 — partial degradation, workaround exists
+        - sev4 — minor, no customer impact
+    validations:
+      required: true
+  - type: input
+    id: started_at
+    attributes:
+      label: Started at (UTC)
+      description: ISO-8601, when impact began (not when it was noticed)
+      placeholder: 2026-10-01T09:14Z
+    validations:
+      required: true
+  - type: input
+    id: resolved_at
+    attributes:
+      label: Resolved at (UTC)
+      description: ISO-8601; leave empty while ongoing and edit when resolved
+      placeholder: 2026-10-01T10:02Z
+  - type: checkboxes
+    id: classification
+    attributes:
+      label: Classification
+      options:
+        - label: Caused by a change/deployment
+        - label: Escaped defect (should have been caught pre-production)
+  - type: input
+    id: deployment_id
+    attributes:
+      label: Deployment ID
+      description: If caused by a deployment, its ID, e.g. deploy-kind-<gitops commit sha>
+  - type: input
+    id: problem_ref
+    attributes:
+      label: Problem reference
+      description: Linked problem record/issue, if any
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, impact, and how it was resolved
+    validations:
+      required: true
+  - type: textarea
+    id: pir_actions
+    attributes:
+      label: PIR actions
+      description: Post-incident review actions as a task list; tick them off as they're done
+      value: |
+        - [ ] 

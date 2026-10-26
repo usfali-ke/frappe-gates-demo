@@ -1,0 +1,85 @@
+name: Gate
+description: >
+  Combines this run's control verdicts into one gate decision
+  (.github/scripts/gate.py lists which control job answers which
+  criterion), writes it to the job summary, uploads it as artifact
+  `gate-result-<GATE>` (release stages: `gate-result-<GATE>-<env>`, since
+  one release run records the same gate in several environments) when
+  `record` is true — the security dashboard
+  pulls it, since GitHub-hosted runners can't reach the dashboard — and
+  fails unless the gate passed, which stops every later stage.
+
+inputs:
+  gate:
+    description: G1 | G2 | G3 | G5 | G6
+    required: true
+  needs:
+    description: toJSON(needs) of the calling job (toJSON(steps) also works, see gate.py)
+    required: true
+  subject:
+    description: What was evaluated (pr-123, image digest). Re-evaluating the same subject after a fail counts as rework.
+    required: true
+  record:
+    description: Upload gate-result-<GATE> for the dashboard ('true'/'false')
+    default: "true"
+  allow-skipped:
+    description: Comma-separated criterion keys that may be `skipped` in this context
+    default: ""
+  commit-sha:
+    default: ""
+  artifact-digest:
+    default: ""
+  environment:
+    default: ""
+  profile:
+    description: Alternative criteria list for this gate (gate.py GATES["<gate>@<profile>"]), e.g. staging
+    default: ""
+  started-at:
+    description: ISO-8601; defaults to now
+    default: ""
+  name-suffix:
+    description: Appended to the artifact name (`-<env>` in a release stage)
+    default: ""
+
+outputs:
+  status:
+    value: ${{ steps.assemble.outputs.status }}
+
+runs:
+  using: composite
+  steps:
+    - id: assemble
+      shell: bash
+      # Values via env only — a crafted branch name or tool message can't
+      # inject shell.
+      env:
+        NEEDS: ${{ inputs.needs }}
+        SUBJECT: ${{ inputs.subject }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        DIGEST: ${{ inputs.artifact-digest }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        STARTED_AT: ${{ inputs.started-at }}
+        ALLOW_SKIPPED: ${{ inputs.allow-skipped }}
+        GATE: ${{ inputs.gate }}
+        PROFILE: ${{ inputs.profile }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/gate"
+        python3 .github/scripts/gate.py "$GATE" "$RUNNER_TEMP/gate/gate-result.json"
+    # Not recorded (e.g. G2 on a pull request, whose image is never
+    # published): kept as `gate-preview-<GATE>` for the evidence bundle,
+    # a name the dashboard doesn't collect.
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: gate-${{ inputs.record == 'true' && 'result' || 'preview' }}-${{ inputs.gate }}${{ inputs.name-suffix }}
+        path: ${{ runner.temp }}/gate/gate-result.json
+        overwrite: true
+        retention-days: 90
+        if-no-files-found: error
+    - name: Enforce
+      if: steps.assemble.outputs.status != 'pass'
+      shell: bash
+      env:
+        GATE: ${{ inputs.gate }}
+      run: |
+        echo "::error::${GATE} failed — later stages will not run; see the criteria in the job summary and the evidence artifact"
+        exit 1

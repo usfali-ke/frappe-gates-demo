@@ -1,0 +1,103 @@
+# Canary analysis — exactly two checks, matching the Argo CD Application's
+# dashboard.validations=functional,security_control. No Prometheus metric
+# exists, so monitoring isn't claimed. Both hit the canary Service only.
+#
+# functional (web provider): the app's health method answers status "ok" —
+# it also queries the database, so a broken DB link fails the canary.
+# security_control (job provider): anonymous access is still refused on both
+# a read and a write, and the login page still answers — the controls the
+# pipeline tested, checked again on the pods taking traffic.
+#
+# The web provider runs in the Argo Rollouts controller's namespace, so its
+# URL needs the namespace: each overlay replaces it (metric 0). The job runs
+# in the app's namespace and uses the short name.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: frappe-gates-demo-canary-health
+spec:
+  metrics:
+    - name: functional
+      interval: 15s
+      count: 3
+      # The canary Service's selector switches the moment the canary pod is
+      # created, so its endpoints can lag the first seconds — and a refused
+      # connection is an Error, not a failed check.
+      initialDelay: 40s
+      failureLimit: 0
+      consecutiveErrorLimit: 3
+      successCondition: result.status == 'ok'
+      provider:
+        web:
+          url: http://frappe-gates-demo-canary.NAMESPACE.svc/api/method/frappe_gates_demo.api.health
+          jsonPath: "{$}"
+          timeoutSeconds: 10
+    - name: security-control
+      count: 1
+      failureLimit: 0
+      provider:
+        job:
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 180
+            template:
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 100
+                  runAsGroup: 101
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: probe
+                    image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      runAsNonRoot: true
+                      capabilities:
+                        drop: ["ALL"]
+                    resources:
+                      requests:
+                        cpu: 10m
+                        memory: 16Mi
+                      limits:
+                        cpu: 100m
+                        memory: 64Mi
+                    env:
+                      - name: BASE
+                        value: http://frappe-gates-demo-canary
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -u
+                        fail=0
+                        # The analysis starts the moment the canary Service's
+                        # selector switches; its endpoints can lag a few
+                        # seconds. Wait for the canary to answer, then check.
+                        i=0
+                        until curl -fsS -o /dev/null --max-time 3 \
+                            "$BASE/api/method/frappe_gates_demo.api.health"; do
+                          i=$((i + 1))
+                          [ "$i" -lt 12 ] || { echo "FAIL canary never answered $BASE/api/method/frappe_gates_demo.api.health"; exit 1; }
+                          sleep 5
+                        done
+                        code=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' \
+                          "$BASE/api/method/frappe_gates_demo.api.notes_list") || code="curl-error"
+                        case "$code" in
+                          403) echo "ok   anonymous read refused (403)" ;;
+                          *)   echo "FAIL anonymous read -> $code, want 403"; fail=1 ;;
+                        esac
+                        code=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' \
+                          -X POST -H 'Content-Type: application/json' -d '{"title":"x"}' \
+                          "$BASE/api/method/frappe_gates_demo.api.note_create") || code="curl-error"
+                        case "$code" in
+                          403) echo "ok   anonymous write refused (403)" ;;
+                          *)   echo "FAIL anonymous write -> $code, want 403"; fail=1 ;;
+                        esac
+                        code=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' "$BASE/login") || code="curl-error"
+                        if [ "$code" = "200" ]; then echo "ok   login page served (200)"
+                        else echo "FAIL login page -> $code, want 200"; fail=1; fi
+                        exit $fail

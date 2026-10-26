@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+
+# Test / analysis artifacts (the pipeline writes these into the workspace)
+reports/
+.coverage
+.coverage.*
+coverage.xml
+.pytest_cache/
+.ruff_cache/
+
+# Local bench leftovers
+sites/
+*.log

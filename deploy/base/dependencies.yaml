@@ -1,0 +1,180 @@
+# The two services a Frappe site needs beside the app: MariaDB (the site's
+# database) and Redis (cache, queue, socketio).
+#
+# This is the shape that makes a Frappe demo deployable in one namespace. A
+# real Frappe platform keeps the database outside the product namespace; here
+# it is per environment so dev/staging/prod are independent and a reset in one
+# cannot damage another.
+#
+# The Secret `frappe-gates-demo` is created out of band (never in git) with
+# keys `db-root-password` and `admin-password`.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frappe-gates-demo-mariadb
+  labels:
+    app: frappe-gates-demo-mariadb
+spec:
+  selector:
+    app: frappe-gates-demo-mariadb
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: frappe-gates-demo-mariadb
+  labels:
+    app: frappe-gates-demo-mariadb
+spec:
+  replicas: 1
+  serviceName: frappe-gates-demo-mariadb
+  selector:
+    matchLabels:
+      app: frappe-gates-demo-mariadb
+  template:
+    metadata:
+      labels:
+        app: frappe-gates-demo-mariadb
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mariadb
+          image: mariadb:10.11
+          args:
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_unicode_ci
+            # Frappe creates many short-lived connections per worker.
+            - --max-connections=300
+          env:
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: frappe-gates-demo
+                  key: db-root-password
+          ports:
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: run
+              mountPath: /run/mysqld
+          readinessProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: run
+          emptyDir:
+            sizeLimit: 16Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # kind's default StorageClass; the cluster has no cloud provisioner.
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frappe-gates-demo-redis
+  labels:
+    app: frappe-gates-demo-redis
+spec:
+  selector:
+    app: frappe-gates-demo-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frappe-gates-demo-redis
+  labels:
+    app: frappe-gates-demo-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frappe-gates-demo-redis
+  template:
+    metadata:
+      labels:
+        app: frappe-gates-demo-redis
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--save", "", "--appendonly", "no", "--maxmemory", "128mb"]
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 192Mi
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi

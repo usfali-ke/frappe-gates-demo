@@ -1,0 +1,1273 @@
+# CI: from a developer's commit to a signed artifact, in ONE run. The
+# SDLC phases (docs/DevSecOps_process.docx) in order, the control gates
+# between them, and every control its own job keeping its report as
+# evidence. Phases run sequentially — a phase's jobs start only when the
+# previous phase's gate passed; controls within a phase run in parallel.
+#
+#   Develop   the source, before anything is built: SAST (semgrep) ·
+#             secrets (gitleaks, trufflehog) · quality (ruff: lint +
+#             complexity) · unit tests + coverage · PR: reviewers ·
+#             signed commits · AI security review
+#     ── G1 merge gate (Develop → Build, on pull requests): reviewed,
+#        signed, tested, no SAST or secret findings. A failed G1 skips
+#        every Build job — the pipeline does not proceed to the phase ──
+#   Build     reproducible image (built twice) · SCA (trivy, lockfile) ·
+#             IaC (checkov) · the built image: trivy · syft SBOM · dockle
+#             (CIS) · django check --deploy; then, main only and only if
+#             every control passed: push the exact built digest to GHCR,
+#             cosign sign + SBOM/SLSA attestations
+#     ── G2 Control Gate (Build → Release): build reproducible, every
+#        scan clean, code quality threshold met, artifact signed + SBOM;
+#        the same job records the Test-phase coverage threshold as
+#        G3 (ci) ──
+#   Release   every report + hash manifest → artifact `evidence` (90 days;
+#             on main attested to the image digest) · starts
+#             devsecops-release.yml for this commit (dev → staging → prod)
+#   Feedback  PR findings comment
+#
+# Plan precedes the pipeline (requirements, acceptance criteria, threat
+# model) and Test is decided against deployed environments in the release
+# pipeline — never against an image nobody deployed.
+#
+# Rules that make the results trustworthy:
+#  - Tools never decide pass/fail (they run "don't fail on findings");
+#    .github/scripts/verdict.py applies the threshold, records the verdict
+#    in the report, and fails the job. A missing report is a fail.
+#  - A gate criterion fails closed when its control didn't run (skipped
+#    after an earlier gate failed, cancelled or crashed) — never an
+#    implicit pass; gate.py's verdict says which.
+#  - Exceptions live in security/accepted-risks.json, each with a reason
+#    and an expiry, and every verdict lists the ones it applied.
+#  - Nothing is rebuilt: Build's image tests use the `image` artifact,
+#    checked against its digest, and publish pushes those same bytes; the
+#    release deploys that digest.
+#  - Every image and action is pinned by digest/SHA.
+#  - G1 goes to the security dashboard on pull requests, G2 on pushes to
+#    main (artifact `gate-result-<G>`). Elsewhere they're `gate-preview-<G>`.
+name: devsecops-pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+  push:
+    branches: [main]
+    # Deploy commits (devsecops-stage.yml) change only deploy/**. To
+    # release a deploy/-only or docs-only change, run this workflow on
+    # main by hand: it publishes like a push.
+    paths-ignore: ["deploy/**", "**.md"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: devsecops-pipeline-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  IMAGE: ghcr.io/usfali-ke/frappe-gates-demo
+  IMAGE_TAG: frappe-gates-demo:ci
+  BASE_IMAGE: python:3.11-slim@sha256:b95327ce1439e687237841b0210677aeadd62d55a060a5f6bcb9c15bf6251dd3
+  SRC_DIRS: frappe_gates_demo
+  LOCKFILE: requirements.txt
+  COVERAGE_THRESHOLD: "90"
+  UV_VERSION: "0.12.19"
+  SEMGREP: semgrep/semgrep:1.177.0@sha256:acaac22ffc7b7cc5926de0751b223bce0b2491c33d18422fa72f632c78d81198
+  GITLEAKS: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  TRUFFLEHOG: trufflesecurity/trufflehog:3.97.9@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db
+  CHECKOV: bridgecrew/checkov:3.3.20@sha256:6d20ebbcde58b2dce6e3151a6771fefa4d468281fe442475455623f5799b9f53
+  TRIVY: aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+  SYFT: anchore/syft:v1.52.0@sha256:500e2d872ac019436926e8322b4fc1f39441d94d21f6f4046c6ff29b30e8cb02
+  DOCKLE: goodwithtech/dockle:v0.4.15@sha256:eade932f793742de0aa8755406c7677cd7696f8675b6180926f7eeffa7abe6b9
+  CERT_ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  # ── Develop: the source, before anything is built (the doc's Plan
+  #    phase precedes the pipeline: requirements, acceptance criteria,
+  #    threat model). Controls within the phase run in parallel. ─────────
+
+  sast-semgrep:
+    name: Develop · SAST · semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: sast-semgrep
+      OUT: reports/sast-semgrep
+      VERDICT_FILE: reports/sast-semgrep/verdict.json
+      NATIVE: reports/sast-semgrep/semgrep.txt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          mkdir -p "$OUT"
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -w /src "$SEMGREP" semgrep scan \
+            --config p/default --config p/python --config p/dockerfile --config p/github-actions \
+            --metrics=off --json-output=/out/semgrep.json --sarif-output=/out/semgrep.sarif --text-output=/out/semgrep.txt -q || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: semgrep 1.177.0 (p/default, python, dockerfile, github-actions)
+        run: python3 .github/scripts/verdict.py semgrep "$OUT/semgrep.json"
+      # The tool's own report under the verdict (findings.py native).
+      - name: tool report
+        if: always()
+        run: python3 .github/scripts/findings.py native "$NATIVE"
+      # Code scanning: the same findings inline on the PR diff and in the
+      # Security tab. Public repos only (private ones need GitHub Advanced
+      # Security); a fork PR's token can't write, hence continue-on-error.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/sast-semgrep/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/sast-semgrep/findings.sarif
+          category: semgrep
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-sast-semgrep
+          path: reports/sast-semgrep/
+          if-no-files-found: ignore
+
+  secrets-gitleaks:
+    name: Develop · secrets · gitleaks (full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: secrets-gitleaks
+      OUT: reports/secrets-gitleaks
+      VERDICT_FILE: reports/secrets-gitleaks/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: |
+          mkdir -p "$OUT"
+          docker run --rm -v "$PWD:/repo" -w /repo "$GITLEAKS" git /repo --redact --verbose --no-color \
+            --report-format json --report-path "/repo/$OUT/gitleaks.json" --exit-code 0 || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: gitleaks 8.30.1
+          SCOPE: every commit reachable from this ref
+        run: python3 .github/scripts/verdict.py gitleaks "$OUT/gitleaks.json"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/secrets-gitleaks/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/secrets-gitleaks/findings.sarif
+          category: secrets-gitleaks
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-secrets-gitleaks
+          path: reports/secrets-gitleaks/
+          if-no-files-found: ignore
+
+  secrets-trufflehog:
+    name: Develop · secrets · trufflehog (verified)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: secrets-trufflehog
+      OUT: reports/secrets-trufflehog
+      VERDICT_FILE: reports/secrets-trufflehog/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: scan
+        # Verification calls each candidate's own API to see if it is live.
+        # The secret values are dropped before anything is stored.
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          docker run --rm -v "$PWD:/repo:ro" "$TRUFFLEHOG" git file:///repo --json --no-update \
+            --results=verified,unknown,unverified > raw.jsonl
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          jq -c 'select(.DetectorName) | del(.Raw, .RawV2) | .ExtraData = null' raw.jsonl > "$OUT/trufflehog.jsonl"
+          rm -f raw.jsonl
+      - id: verdict
+        if: always()
+        env:
+          RC: ${{ steps.scan.outputs.rc }}
+          TOOL: trufflehog 3.97.9
+        run: python3 .github/scripts/verdict.py trufflehog "$OUT/trufflehog.jsonl"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-secrets-trufflehog
+          path: reports/secrets-trufflehog/
+          if-no-files-found: ignore
+
+  code-quality:
+    name: Develop · quality · ruff (lint + complexity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: code-quality
+      OUT: reports/code-quality
+      VERDICT_FILE: reports/code-quality/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      # ruff is a locked dev dependency; the rules and the complexity limit
+      # are pyproject.toml [tool.ruff.lint], so the threshold is versioned
+      # with the code it applies to.
+      - run: |
+          mkdir -p "$OUT"
+          # shellcheck disable=SC2086 # SRC_DIRS is a list
+          uv run --no-project --with ruff==0.14.4 ruff check --output-format json $SRC_DIRS tests > "$OUT/ruff.json" || true
+          # shellcheck disable=SC2086
+          uv run --no-project --with ruff==0.14.4 ruff check --output-format concise $SRC_DIRS tests > "$OUT/ruff.txt" || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: ruff (pyproject.toml [tool.ruff.lint])
+        run: python3 .github/scripts/verdict.py ruff "$OUT/ruff.json"
+      - name: tool report
+        if: always()
+        run: python3 .github/scripts/findings.py native "$OUT/ruff.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-code-quality
+          path: reports/code-quality/
+          if-no-files-found: ignore
+
+  unit-tests:
+    name: Develop · unit tests + coverage (bench)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    # A Frappe app is tested inside a bench against a real MariaDB and Redis:
+    # the framework's test runner creates and drops doctypes in the database.
+    services:
+      mariadb:
+        image: mariadb:10.11
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=3s --health-retries=30
+    outputs:
+      result: ${{ steps.tests.outputs.result }}
+      coverage: ${{ steps.coverage.outputs.coverage }}
+    env:
+      FRAPPE_BRANCH: v15.123.1
+      BENCH_DIR: ${{ github.workspace }}/../frappe-bench
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_ROOT_PASSWORD: root
+      ADMIN_PASSWORD: admin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "18"
+      - id: run
+        # The framework is pinned to the TAG our product apps run (Frappe v15),
+        # never a branch head: the same commit must test the same framework.
+        run: |
+          set -uo pipefail
+          mkdir -p reports/unit-tests reports/coverage
+          rc=0
+          python -m pip install --quiet "frappe-bench==5.31.0" "coverage~=7.6" "unittest-xml-reporting~=3.2" || rc=$?
+          [ "$rc" != 0 ] || bench init --frappe-branch "$FRAPPE_BRANCH" --skip-redis-config-generation \
+            --skip-assets --python python3.11 "$BENCH_DIR" || rc=$?
+          [ "$rc" != 0 ] || bench --site test_site new-site test_site \
+            --db-host "$DB_HOST" --db-port "$DB_PORT" \
+            --mariadb-root-username root --mariadb-root-password "$DB_ROOT_PASSWORD" \
+            --admin-password "$ADMIN_PASSWORD" --no-mariadb-socket \
+            --force --verbose 2>&1 | tail -5 || true
+          [ "$rc" != 0 ] || bench get-app "$GITHUB_WORKSPACE" --skip-assets || rc=$?
+          [ "$rc" != 0 ] || bench --site test_site install-app frappe_gates_demo || rc=$?
+          [ "$rc" != 0 ] || python - <<'PY' || rc=$?
+          import json, pathlib
+          p = pathlib.Path("sites/common_site_config.json")
+          cfg = json.loads(p.read_text())
+          cfg.update({"redis_cache": "redis://127.0.0.1:6379/0",
+                      "redis_queue": "redis://127.0.0.1:6379/1",
+                      "redis_socketio": "redis://127.0.0.1:6379/2",
+                      "allow_tests": True})
+          p.write_text(json.dumps(cfg, indent=1))
+          PY
+          [ "$rc" != 0 ] || bench setup requirements --dev || rc=$?
+          # Coverage is measured around the FRAMEWORK's own runner, from
+          # sites/ (that is where bench executes frappe commands), so the
+          # number covers the app's code paths a test actually exercises.
+          [ "$rc" != 0 ] || ( cd "$BENCH_DIR/sites" && ../env/bin/coverage run \
+            --rcfile="$GITHUB_WORKSPACE/.coveragerc" \
+            -m frappe.utils.bench_helper frappe --site test_site run-tests \
+            --app frappe_gates_demo --junit-xml-output "$GITHUB_WORKSPACE/reports/unit-tests/junit.xml" ) || rc=$?
+          [ "$rc" != 0 ] || ( cd "$BENCH_DIR/sites" && ../env/bin/coverage xml -o "$GITHUB_WORKSPACE/reports/coverage/coverage.xml" -q ) || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+      - id: tests
+        if: always()
+        env:
+          CONTROL: unit-tests
+          VERDICT_FILE: reports/unit-tests/verdict.json
+          RC: ${{ steps.run.outputs.rc }}
+          LABEL: tests/unit (bench run-tests)
+          TOOL: frappe bench run-tests + unittest-xml-reporting
+        run: python3 .github/scripts/verdict.py tests reports/unit-tests/junit.xml
+      - id: coverage
+        if: always()
+        env:
+          CONTROL: coverage
+          VERDICT_FILE: reports/coverage/verdict.json
+          OUTPUT: coverage
+          TOOL: coverage.py (bench test run)
+        run: python3 .github/scripts/verdict.py coverage reports/coverage/coverage.xml
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-unit-tests
+          path: reports/unit-tests/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-coverage
+          path: reports/coverage/
+          if-no-files-found: ignore
+
+  reviewers:
+    name: Develop · governance · reviewers
+    if: startsWith(github.event_name, 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: reviewers
+      OUT: reports/reviewers
+      VERDICT_FILE: reports/reviewers/verdict.json
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$OUT"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" --jq '.[] | tojson' > "$OUT/reviews.jsonl"
+      - id: verdict
+        if: always()
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REQUIRED_APPROVALS: "1"
+          TOOL: GitHub pull request reviews API
+        run: python3 .github/scripts/verdict.py reviewers "$OUT/reviews.jsonl"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-reviewers
+          path: reports/reviewers/
+          if-no-files-found: ignore
+
+  ai-review:
+    name: Develop · AI security review · Hermes
+    if: startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: lab-runner
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: ai-review
+      OUT: reports/ai-review
+      VERDICT_FILE: reports/ai-review/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: verdict
+        env:
+          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL || 'http://192.168.122.191:8644/webhooks/github-pr-review' }}
+          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+          HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WAIT_SECONDS: "1500"
+        run: python3 .github/scripts/hermes_review.py
+      # Supplementary evidence only — the verdict reaches gate-g1 through the
+      # job output. lab-runner's egress to GitHub's artifact storage is
+      # flaky (ETIMEDOUT), and that must not turn a passing review red.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        continue-on-error: true
+        with:
+          name: report-ai-review
+          path: reports/ai-review/
+          if-no-files-found: ignore
+
+  commits-signed:
+    name: Develop · governance · signed commits
+    if: startsWith(github.event_name, 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: commits-signed
+      OUT: reports/commits-signed
+      VERDICT_FILE: reports/commits-signed/verdict.json
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      # GitHub's own verification (signature by a key registered to the
+      # committer) — not merely "has a signature".
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$OUT"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
+            --jq '.[] | [.sha[0:7], (.commit.verification.verified|tostring), .commit.verification.reason] | @tsv' > "$OUT/commits.tsv"
+      - id: verdict
+        if: always()
+        env:
+          TOOL: GitHub commit verification
+        run: python3 .github/scripts/verdict.py commits "$OUT/commits.tsv"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-commits-signed
+          path: reports/commits-signed/
+          if-no-files-found: ignore
+
+  # ── G1 merge gate, the phase boundary Develop → Build. Mandatory on
+  #    pull requests: when any Develop control failed the gate fails, and
+  #    every Build job below is skipped — the pipeline stops at the phase.
+  #    On a push to main G1 is skipped: the merge already happened under
+  #    branch protection.
+
+  gate-g1:
+    name: G1 merge gate (Develop → Build)
+    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed, ai-review]
+    if: always() && startsWith(github.event_name, 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: ./.github/actions/gate
+        with:
+          gate: G1
+          needs: ${{ toJSON(needs) }}
+          subject: pr-${{ github.event.pull_request.number }}
+          commit-sha: ${{ github.event.pull_request.head.sha }}
+
+  # ── Build: the artifact — reproducible, scanned, signed. Nothing here
+  #    runs on a PR whose G1 failed. SCA, IaC and the reproducible build
+  #    are the doc's Build-phase controls; the image jobs test the `image`
+  #    artifact from the build, checked against its digest. ───────────────
+
+  build:
+    name: Build · image (reproducible)
+    needs: [gate-g1]
+    # The phase boundary: on a PR nothing is built until the merge gate
+    # passed — a failed G1 skips this job and the whole Build phase. On a
+    # push to main there is no G1 (skipped: the merge already happened
+    # under branch protection) and Build proceeds.
+    if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.repro.outputs.d1 }}
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: build
+      OUT: reports/build
+      VERDICT_FILE: reports/build/verdict.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: repro
+        name: Build twice, compare digests
+        # SOURCE_DATE_EPOCH = commit time, timestamps rewritten, no BuildKit
+        # provenance/SBOM (they embed build time); the second build ignores
+        # the cache. Both on this runner: deterministic here, not proof an
+        # independent rebuilder gets the same bytes.
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct); export SOURCE_DATE_EPOCH
+          common=(--provenance=false --sbom=false --build-arg SOURCE_DATE_EPOCH -t "$IMAGE_TAG"
+                  --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+                  --label "org.opencontainers.image.revision=${GITHUB_SHA}")
+          rc=0
+          docker buildx build "${common[@]}" --output "type=oci,dest=image.oci.tar,rewrite-timestamp=true" --metadata-file "$OUT/build-1.json" . || rc=1
+          docker buildx build "${common[@]}" --no-cache --output "type=oci,dest=rebuild.oci.tar,rewrite-timestamp=true" --metadata-file "$OUT/build-2.json" . || rc=1
+          { echo "rc=$rc"
+            echo "d1=$(jq -r '."containerimage.digest" // empty' "$OUT/build-1.json" 2>/dev/null)"
+            echo "d2=$(jq -r '."containerimage.digest" // empty' "$OUT/build-2.json" 2>/dev/null)"; } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.repro.outputs.d1 != ''
+        with:
+          name: image
+          path: image.oci.tar
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+      - id: verdict
+        if: always()
+        env:
+          RC: ${{ steps.repro.outputs.rc }}
+          D1: ${{ steps.repro.outputs.d1 }}
+          D2: ${{ steps.repro.outputs.d2 }}
+          TOOL: docker buildx (BuildKit, OCI exporter)
+        run: python3 .github/scripts/verdict.py build Dockerfile
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-build
+          path: reports/build/
+          if-no-files-found: ignore
+
+  sca-trivy:
+    name: Build · SCA · trivy (lockfile)
+    needs: [gate-g1]
+    # The phase boundary: on a PR nothing is built until the merge gate
+    # passed — a failed G1 skips this job and the whole Build phase. On a
+    # push to main there is no G1 (skipped: the merge already happened
+    # under branch protection) and Build proceeds.
+    if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: sca-trivy
+      OUT: reports/sca-trivy
+      VERDICT_FILE: reports/sca-trivy/verdict.json
+      NATIVE: reports/sca-trivy/trivy-fs.txt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          mkdir -p "$OUT"
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            fs --scanners vuln --list-all-pkgs --include-dev-deps --format json --output /out/trivy-fs.json --exit-code 0 -q /src || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: trivy 0.74.0 (fs, lockfile incl. dev dependencies)
+        run: python3 .github/scripts/verdict.py trivy-fs "$OUT/trivy-fs.json"
+      # trivy's table from the same JSON (no second scan): the severities
+      # that block, minus the accepted risks.
+      - name: tool report
+        if: always()
+        run: |
+          touch "$OUT/accepted-ids.txt"
+          docker run --rm -v "$PWD/$OUT:/out" "$TRIVY" convert --format table --severity CRITICAL,HIGH,UNKNOWN \
+            --ignorefile /out/accepted-ids.txt --output /out/trivy-fs.txt /out/trivy-fs.json -q || true
+          python3 .github/scripts/findings.py native "$NATIVE"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/sca-trivy/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/sca-trivy/findings.sarif
+          category: sca-trivy
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-sca-trivy
+          path: reports/sca-trivy/
+          if-no-files-found: ignore
+
+  iac-checkov:
+    name: Build · IaC · checkov (Dockerfile + k8s render)
+    needs: [gate-g1]
+    # The phase boundary: on a PR nothing is built until the merge gate
+    # passed — a failed G1 skips this job and the whole Build phase. On a
+    # push to main there is no G1 (skipped: the merge already happened
+    # under branch protection) and Build proceeds.
+    if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: iac-checkov
+      OUT: reports/iac-checkov
+      VERDICT_FILE: reports/iac-checkov/verdict.json
+      NATIVE: reports/iac-checkov/results_github_failed_only.md
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - run: |
+          set -uo pipefail
+          mkdir -p "$OUT/input"
+          cp Dockerfile "$OUT/input/Dockerfile"
+          # checkov skips CRDs, so the Rollout is scanned as the Deployment
+          # it is equivalent to (scan_view.py) — never applied.
+          # Prod's render: every overlay is deploy/base plus names and a digest.
+          kubectl kustomize deploy/prod | uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > "$OUT/input/prod.yaml" || exit 0
+          docker run --rm -v "$PWD/$OUT:/work" "$CHECKOV" -f /work/input/prod.yaml -f /work/input/Dockerfile \
+            --framework kubernetes dockerfile -o cli -o github_failed_only -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
+          mv "$OUT/results_json.json" "$OUT/checkov.json" || true
+          cat "$OUT/results_cli.txt" 2>/dev/null || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: checkov 3.3.20
+        run: python3 .github/scripts/verdict.py checkov "$OUT/checkov.json"
+      # The tool's own report under the verdict (findings.py native).
+      - name: tool report
+        if: always()
+        run: python3 .github/scripts/findings.py native "$NATIVE"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/iac-checkov/findings.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/iac-checkov/findings.sarif
+          category: iac-checkov
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-iac-checkov
+          path: reports/iac-checkov/
+          if-no-files-found: ignore
+
+  image-scan:
+    name: Build · image scan · trivy
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: image-scan
+      OUT: reports/image-scan
+      VERDICT_FILE: reports/image-scan/verdict.json
+      NATIVE: reports/image-scan/trivy.txt
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image
+          path: ${{ runner.temp }}/image
+      - run: |
+          set -uo pipefail
+          mkdir -p "$OUT" "$RUNNER_TEMP/oci"
+          tar -xf "$RUNNER_TEMP/image/image.oci.tar" -C "$RUNNER_TEMP/oci"
+          got=$(jq -r '.manifests[0].digest' "$RUNNER_TEMP/oci/index.json")
+          [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
+          docker run --rm -v "$RUNNER_TEMP/oci:/oci:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            image --input /oci --scanners vuln,secret --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q || true
+          docker run --rm -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            convert --format sarif --output /out/trivy.sarif /out/trivy.json -q || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: trivy 0.74.0 (OS + Python packages, secrets)
+        run: python3 .github/scripts/verdict.py trivy "$OUT/trivy.json"
+      # As in sca-trivy: trivy's table from the same JSON, minus accepted risks.
+      - name: tool report
+        if: always()
+        run: |
+          touch "$OUT/accepted-ids.txt"
+          docker run --rm -v "$PWD/$OUT:/out" "$TRIVY" convert --format table \
+            --ignorefile /out/accepted-ids.txt --output /out/trivy.txt /out/trivy.json -q || true
+          python3 .github/scripts/findings.py native "$NATIVE"
+      # Code scanning, as in sast-semgrep.
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/image-scan/trivy.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        continue-on-error: true
+        with:
+          sarif_file: reports/image-scan/trivy.sarif
+          category: trivy-image
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-image-scan
+          path: reports/image-scan/
+          if-no-files-found: ignore
+
+  sbom:
+    name: Build · SBOM (syft)
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: sbom
+      OUT: reports/sbom
+      VERDICT_FILE: reports/sbom/verdict.json
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image
+          path: ${{ runner.temp }}/image
+      - run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          got=$(tar -xOf "$RUNNER_TEMP/image/image.oci.tar" index.json | jq -r '.manifests[0].digest')
+          [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
+          docker run --rm -v "$RUNNER_TEMP/image:/image:ro" -v "$PWD/$OUT:/out" "$SYFT" \
+            oci-archive:/image/image.oci.tar -q -o cyclonedx-json=/out/sbom.cdx.json || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: syft 1.52.0
+        run: python3 .github/scripts/verdict.py sbom "$OUT/sbom.cdx.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-sbom
+          path: reports/sbom/
+          if-no-files-found: ignore
+
+  image-compliance:
+    name: Build · CIS benchmark (dockle)
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: image-compliance
+      OUT: reports/image-compliance
+      VERDICT_FILE: reports/image-compliance/verdict.json
+      NATIVE: reports/image-compliance/dockle.txt
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image
+          path: ${{ runner.temp }}/image
+      - run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          got=$(tar -xOf "$RUNNER_TEMP/image/image.oci.tar" index.json | jq -r '.manifests[0].digest')
+          [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
+          # docker load only reads OCI layouts with the containerd image store
+          skopeo copy --quiet "oci-archive:$RUNNER_TEMP/image/image.oci.tar" "docker-daemon:$IMAGE_TAG"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/$OUT:/out" "$DOCKLE" \
+            -f json -o /out/dockle.json --exit-code 0 "$IMAGE_TAG" || true
+      - id: verdict
+        if: always()
+        env:
+          TOOL: dockle 0.4.15
+        run: python3 .github/scripts/verdict.py dockle "$OUT/dockle.json"
+      # dockle's own text report (a second, local run), accepted checks left out.
+      - name: tool report
+        if: always()
+        run: |
+          touch "$OUT/accepted-ids.txt"
+          mapfile -t ignore < <(sed 's/^/-i=/' "$OUT/accepted-ids.txt")
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/$OUT:/out" "$DOCKLE" \
+            --no-color --exit-code 0 "${ignore[@]}" -o /out/dockle.txt "$IMAGE_TAG" || true
+          python3 .github/scripts/findings.py native "$NATIVE"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-image-compliance
+          path: reports/image-compliance/
+          if-no-files-found: ignore
+
+  frappe-migrate-check:
+    name: Build · frappe migrate (the artifact applies its own schema)
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      CONTROL: frappe-migrate-check
+      OUT: reports/frappe-migrate-check
+      VERDICT_FILE: reports/frappe-migrate-check/verdict.json
+      NATIVE: reports/frappe-migrate-check/migrate.txt
+      DIGEST: ${{ needs.build.outputs.digest }}
+      SITE: frappe-gates-demo.local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image
+          path: ${{ runner.temp }}/image
+      - id: check
+        # The Django demo runs `manage.py check --deploy` here. Frappe's
+        # equivalent compliance surface is the migration: the image must boot
+        # with no source tree, create a site, install the app and apply the
+        # app's doctypes to a real MariaDB. That is what proves the artifact
+        # ships its schema (a missing doctype JSON only shows up here).
+        run: |
+          set -uo pipefail
+          mkdir -p "$OUT"
+          got=$(tar -xOf "$RUNNER_TEMP/image/image.oci.tar" index.json | jq -r '.manifests[0].digest')
+          [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
+          skopeo copy --quiet "oci-archive:$RUNNER_TEMP/image/image.oci.tar" "docker-daemon:$IMAGE_TAG"
+          docker network create "$CONTROL" > /dev/null 2>&1 || true
+          docker run -d --name "$CONTROL-mariadb" --network "$CONTROL" -e MARIADB_ROOT_PASSWORD=root mariadb:10.11 > /dev/null
+          docker run -d --name "$CONTROL-redis" --network "$CONTROL" redis:7-alpine > /dev/null
+          # The image's entrypoint creates the site, installs the app, migrates,
+          # then runs this command: a second migrate proves the shipped schema
+          # is complete and the operation is idempotent.
+          docker run --rm --network "$CONTROL" \
+            -e DB_HOST="$CONTROL-mariadb" -e DB_ROOT_PASSWORD=root \
+            -e REDIS_CACHE_URL="redis://$CONTROL-redis:6379/0" \
+            -e REDIS_QUEUE_URL="redis://$CONTROL-redis:6379/1" \
+            -e REDIS_SOCKETIO_URL="redis://$CONTROL-redis:6379/2" \
+            -e SITE_NAME="$SITE" \
+            "$IMAGE_TAG" bench --site "$SITE" migrate --verbose > "$OUT/migrate.txt" 2>&1
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          docker rm -f "$CONTROL-mariadb" "$CONTROL-redis" > /dev/null 2>&1 || true
+          docker network rm "$CONTROL" > /dev/null 2>&1 || true
+      - id: verdict
+        if: always()
+        env:
+          RC: ${{ steps.check.outputs.rc }}
+          TOOL: frappe bench migrate (site created + app installed in the image)
+        run: python3 .github/scripts/verdict.py frappe-migrate "$OUT/migrate.txt"
+      # The tool's own report under the verdict (findings.py native).
+      - name: tool report
+        if: always()
+        run: python3 .github/scripts/findings.py native "$NATIVE"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-frappe-migrate-check
+          path: reports/frappe-migrate-check/
+          if-no-files-found: ignore
+
+  publish:
+    name: Build · push + sign + attest (GHCR)
+    needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog,
+            sca-trivy, iac-checkov, image-scan, sbom, image-compliance, frappe-migrate-check]
+    if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+      published: ${{ steps.verify.outputs.failed == '' && steps.verify.outcome == 'success' }}
+    env:
+      CONTROL: publish
+      OUT: reports/publish
+      VERDICT_FILE: reports/publish/verdict.json
+      DIGEST: ${{ needs.build.outputs.digest }}
+      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.build.outputs.digest }}
+      PUBLISH: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+      # The keyless signature's identity is this file on main — what
+      # Kyverno admits and devsecops-release.yml verifies.
+      CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - id: ready
+        name: Every Develop and Build control passed?
+        # A signature is the statement "this passed every static control".
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          mkdir -p "$OUT"
+          not_ready=$(jq -r 'to_entries | map(select(.value.result != "success") | .key) | join(", ")' <<<"$NEEDS")
+          echo "not_ready=$not_ready" >> "$GITHUB_OUTPUT"
+          echo "go=$([ -z "$not_ready" ] && [ "$PUBLISH" = true ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.ready.outputs.go == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image
+          path: ${{ runner.temp }}/image
+      - if: steps.ready.outputs.go == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: report-sbom
+          path: ${{ runner.temp }}/sbom
+      - if: steps.ready.outputs.go == 'true'
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          # cosign v2 writes the .sig/.att tags Kyverno verifies.
+          cosign-release: v2.6.5
+      - if: steps.ready.outputs.go == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - if: steps.ready.outputs.go == 'true'
+        name: Push the tested bytes (digest preserved)
+        run: |
+          set -euo pipefail
+          skopeo copy --preserve-digests "oci-archive:${RUNNER_TEMP}/image/image.oci.tar" "docker://${IMAGE}:sha-${GITHUB_SHA}"
+          pushed=$(skopeo inspect --raw "docker://${IMAGE}:sha-${GITHUB_SHA}" | sha256sum | cut -d' ' -f1)
+          [ "sha256:$pushed" = "$DIGEST" ] || { echo "::error::registry has sha256:$pushed, built $DIGEST"; exit 1; }
+      - if: steps.ready.outputs.go == 'true'
+        name: Sign, attest SBOM + SLSA v1 provenance
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_ID: ${{ github.repository_id }}
+          OWNER_ID: ${{ github.repository_owner_id }}
+          RUNNER_ENV: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/slsa_predicate.py > "$OUT/provenance.slsa1.json"
+          cosign sign --yes "$REF"
+          cosign attest --yes --type cyclonedx --predicate "$RUNNER_TEMP/sbom/sbom.cdx.json" "$REF"
+          cosign attest --yes --type slsaprovenance1 --predicate "$OUT/provenance.slsa1.json" "$REF"
+      - if: steps.ready.outputs.go == 'true'
+        # GitHub's attestation store too (`gh attestation verify`). Not
+        # pushed to the registry: GHCR has no referrers API, so pushing
+        # rewrites the sha256-<digest> fallback tag and drops cosign's SBOM.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ needs.build.outputs.digest }}
+      - id: verify
+        if: always() && steps.ready.outputs.go == 'true'
+        # Pass means the signature and both attestations verify against the
+        # identity admission checks — not merely that signing ran.
+        run: |
+          fail=""
+          id=(--certificate-identity "$CERT_IDENTITY" --certificate-oidc-issuer "$CERT_ISSUER")
+          cosign verify "${id[@]}" "$REF" > "$OUT/cosign-verify.json" || fail="$fail signature"
+          cosign verify-attestation "${id[@]}" --type cyclonedx "$REF" > /dev/null || fail="$fail sbom-attestation"
+          cosign verify-attestation "${id[@]}" --type slsaprovenance1 "$REF" > /dev/null || fail="$fail slsa-attestation"
+          echo "failed=$fail" >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          NOT_READY: ${{ steps.ready.outputs.not_ready }}
+          GO: ${{ steps.ready.outputs.go }}
+          VERIFY_FAILED: ${{ steps.verify.outputs.failed }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          TOOL: skopeo + cosign 2.6.5 (keyless, Rekor) + actions/attest-build-provenance
+        run: |
+          if [ -n "$NOT_READY" ]; then
+            python3 .github/scripts/verdict.py signed   # fail: lists the controls that didn't pass
+          elif [ "$GO" != true ]; then
+            python3 .github/scripts/verdict.py result skipped \
+              "not published: images are pushed and signed only from main — a push or a manual run (this run: ${GITHUB_EVENT_NAME} on ${GITHUB_REF}); every Develop and Build control passed"
+          elif [ "$VERIFY_OUTCOME" = success ]; then
+            python3 .github/scripts/verdict.py signed
+          else
+            VERIFY_FAILED="${VERIFY_FAILED:- push/sign step failed}" python3 .github/scripts/verdict.py signed
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-publish
+          path: reports/publish/
+          if-no-files-found: ignore
+
+  # ── G2 Control Gate, the phase boundary Build → Release: nothing is
+  #    released unless it passed for this digest, which devsecops-release
+  #    checks in the signed evidence. The same job records the Test-phase
+  #    coverage threshold as G3 (profile "ci"), decided here in CI where
+  #    coverage is measured. A criterion whose control never ran (e.g.
+  #    Build skipped because G1 failed) fails closed — never an implicit
+  #    pass.
+
+  gate-g2:
+    name: G2 Control Gate (Build → Release)
+    needs: [gate-g1, build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
+            image-scan, sbom, image-compliance, frappe-migrate-check, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - id: gate
+        uses: ./.github/actions/gate
+        with:
+          gate: G2
+          needs: ${{ toJSON(needs) }}
+          subject: ${{ needs.build.outputs.digest || github.sha }}
+          artifact-digest: ${{ needs.build.outputs.digest }}
+          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+          allow-skipped: ${{ !(github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) && 'artifact_signed_attested' || '' }}
+      # Doc mapping: the coverage threshold is a TEST-phase (G3) criterion,
+      # decided here in CI where coverage is measured. Same Control Gate
+      # job records it as gate G3 so the dashboard's G3 sees it alongside
+      # the stage pipeline's functional/performance/DAST decisions. Runs
+      # even when the G2 gate failed (both verdicts belong in the record);
+      # this step failing fails the job, and the release job below requires
+      # needs.gate-g2.result == 'success' as well as the G2 status.
+      - id: gate-g3
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/gate
+        with:
+          gate: G3
+          profile: ci
+          needs: ${{ toJSON(needs) }}
+          subject: ${{ needs.build.outputs.digest || github.sha }}
+          artifact-digest: ${{ needs.build.outputs.digest }}
+          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+
+  # ── Release: the evidence bundle, then the handover to the release
+  #    pipeline (the doc's Test phase runs there, per environment, against
+  #    what was actually deployed — never against an undeployed build).
+
+  evidence:
+    name: Release · evidence bundle
+    needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
+            reviewers, commits-signed, ai-review, image-scan, sbom, image-compliance, frappe-migrate-check, publish,
+            gate-g1, gate-g2]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      DIGEST: ${{ needs.build.outputs.digest }}
+      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.build.outputs.digest }}
+      PREDICATE_TYPE: https://github.com/${{ github.repository }}/evidence/v1
+      CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
+      # Controls that apply to this event; the rest aren't listed as missing.
+      CONTROLS: >-
+        build,unit-tests,coverage,code-quality,sast-semgrep,secrets-gitleaks,secrets-trufflehog,
+        sca-trivy,iac-checkov,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,ai-review,' || '' }}image-scan,sbom,
+        image-compliance,frappe-migrate-check,publish
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: report-*
+          path: ${{ runner.temp }}/in
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gate-*
+          path: ${{ runner.temp }}/in
+      - name: Bundle + hash manifest
+        env:
+          # G2's `record` (a lone gate artifact downloads without its folder)
+          GATE_RECORDED: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+        run: |
+          set -euo pipefail
+          CONTROLS=$(tr -d ' \n' <<<"$CONTROLS") python3 .github/scripts/evidence.py "$RUNNER_TEMP/in" evidence
+          (cd evidence && find . -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evidence
+          path: evidence/
+          retention-days: 90
+          if-no-files-found: error
+      # On main, bind the evidence to the published image: anyone holding
+      # the digest can fetch and verify the manifest, then check each report
+      # file against its sha256. devsecops-release.yml requires it.
+      - if: needs.publish.outputs.published == 'true'
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+      - if: needs.publish.outputs.published == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - if: needs.publish.outputs.published == 'true'
+        name: Attest the evidence manifest to the image digest
+        run: |
+          set -euo pipefail
+          cosign attest --yes --type "$PREDICATE_TYPE" --predicate evidence/manifest.json "$REF"
+          cosign verify-attestation --type "$PREDICATE_TYPE" --certificate-identity "$CERT_IDENTITY" \
+            --certificate-oidc-issuer "$CERT_ISSUER" "$REF" > /dev/null
+          echo "Evidence manifest attested to ${REF} (${PREDICATE_TYPE})" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Release · start the release pipeline
+    needs: [publish, gate-g2, evidence]
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.publish.outputs.published == 'true'
+      && needs.gate-g2.outputs.status == 'pass' && needs.gate-g2.result == 'success'
+      && needs.evidence.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          # Opt-in, repo-wide: a two-person team where the author and the
+          # releaser are the run's only two accounts has no eligible approver
+          # left, so the pipeline carries the documented segregation-of-duties
+          # exception into the run it starts. Unset (the default) keeps the
+          # strict rule. The waiver is recorded in each gate's verdict detail.
+          SELF_APPROVAL: ${{ vars.ALLOW_SELF_APPROVAL }}
+        run: |
+          set -euo pipefail
+          args=(-f start=dev -f kind=planned -f "commit=$GITHUB_SHA")
+          # The documented segregation-of-duties exception, opt-in from the
+          # ALLOW_SELF_APPROVAL repository variable. approvals.sh refuses it
+          # unless the account behind the run is a repository admin.
+          [ -z "$SELF_APPROVAL" ] || args+=(-f "allow-self-approval=$SELF_APPROVAL")
+          gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main "${args[@]}"
+          echo "Started devsecops-release for ${GITHUB_SHA:0:7} (dev → staging → prod): $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/devsecops-release.yml" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Feedback: back to the developers.
+
+  pr-comment:
+    name: Feedback · PR findings comment
+    needs: evidence
+    if: always() && startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: report-*
+          path: ${{ runner.temp }}/current
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gate-*
+          path: ${{ runner.temp }}/current
+      - name: Baseline (latest completed run on main)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          read -r id sha < <(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/devsecops-pipeline.yml/runs?branch=main&status=completed&per_page=20" \
+            --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")][0] | "\(.id) \(.head_sha)"')
+          [ -n "${id:-}" ] && [ "$id" != null ] || exit 0
+          gh run download "$id" -R "$GITHUB_REPOSITORY" -p 'report-*' -D "$RUNNER_TEMP/baseline" && echo "BASELINE_SHA=$sha" >> "$GITHUB_ENV"
+      - name: Post or update the comment
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/findings.py pr-comment "$RUNNER_TEMP/current" "$RUNNER_TEMP/baseline" > "$RUNNER_TEMP/comment.md"
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+          id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- devsecops-findings -->"))) | .id' | head -1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -F "body=@${RUNNER_TEMP}/comment.md" > /dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F "body=@${RUNNER_TEMP}/comment.md" > /dev/null
+          fi

@@ -1,0 +1,69 @@
+# Push every DevSecOps pipeline run's scan reports to DefectDojo, as soon as
+# the run finishes — PRs, pushes and manual runs alike.
+#
+# Runs on the in-cluster self-hosted runner (`lab-runner`, Actions Runner
+# Controller on the kind cluster), which can reach DefectDojo on the lab
+# network; GitHub-hosted runners can't. The upload logic is
+# .github/scripts/defectdojo_upload.py (source of truth:
+# security-dashboard/pipeline/github/defectdojo-upload/).
+#
+# Setup: repository secret DEFECTDOJO_API_KEY (the `ci-uploader` DefectDojo
+# account, authorised on this product only). Optional repository variable
+# DEFECTDOJO_URL overrides the in-cluster default below.
+#
+# workflow_run only fires for this file on the default branch, and runs the
+# default branch's version of it — a PR can't change how its own reports
+# are uploaded. Fork PRs are skipped.
+name: defectdojo-upload
+
+on:
+  workflow_run:
+    workflows: [devsecops-pipeline, devsecops-release]
+    types: [completed]
+
+permissions:
+  actions: read   # list and download the triggering run's artifacts
+  contents: read  # check out the upload script
+
+concurrency:
+  # One upload per branch at a time; never cancel — every run's reports count.
+  group: defectdojo-upload-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    if: >-
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.conclusion != 'skipped' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: lab-runner
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Push to DefectDojo
+        # The script downloads the run's scan-report artifacts itself (not
+        # the container image or gate results) and fails the job if it
+        # can't, so a run whose reports never arrived can't look green.
+        env:
+          DD_URL: ${{ vars.DEFECTDOJO_URL || 'http://172.19.0.1:8080/api/v2' }}
+          DD_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
+          DD_PRODUCT: frappe-gates-demo
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTIFACT_DIR: artifacts
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          if [ -z "$DD_API_KEY" ]; then
+            echo "::error::Repository secret DEFECTDOJO_API_KEY is not set"; exit 1
+          fi
+          python3 .github/scripts/defectdojo_upload.py

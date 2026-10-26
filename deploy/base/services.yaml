@@ -1,0 +1,38 @@
+# Without a traffic router the canary's share of traffic is its share of
+# replicas. Argo Rollouts adds the pod-template-hash selector to -stable /
+# -canary.
+apiVersion: v1
+kind: Service
+metadata:
+  name: frappe-gates-demo
+spec:
+  selector:
+    app: frappe-gates-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frappe-gates-demo-stable
+spec:
+  selector:
+    app: frappe-gates-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frappe-gates-demo-canary
+spec:
+  selector:
+    app: frappe-gates-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

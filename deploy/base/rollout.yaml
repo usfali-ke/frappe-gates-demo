@@ -1,0 +1,145 @@
+# Progressive delivery: half the replicas move to the new digest, the
+# AnalysisTemplate probes the canary, and only a passing analysis promotes
+# to 100%. A failed analysis aborts and scales the canary back to stable.
+#
+# A Frappe site is stateful in ways the Django demo was not: the site
+# directory, the assets and the log tree must be writable, so they are
+# emptyDir mounts while the root filesystem stays read-only. The site is
+# created (and the app installed) by the image's entrypoint on first start —
+# the first rollout of an environment therefore needs a few minutes before
+# the startup probe gives up, which is why it is a startupProbe and not a
+# liveness failure.
+#
+# Shared by every environment; deploy/<env>/ sets the namespace, the replica
+# count and the image digest.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: frappe-gates-demo
+  labels:
+    app: frappe-gates-demo
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: frappe-gates-demo
+  strategy:
+    canary:
+      canaryService: frappe-gates-demo-canary
+      stableService: frappe-gates-demo-stable
+      steps:
+        - setWeight: 50
+        - pause: {duration: 20s}
+        - analysis:
+            templates:
+              - templateName: frappe-gates-demo-canary-health
+        - setWeight: 100
+  template:
+    metadata:
+      labels:
+        app: frappe-gates-demo
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frappe-gates-demo
+          # Kustomize `images:` rewrites this to ghcr.io/...@sha256:<digest>.
+          image: frappe-gates-demo
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              # The API server defaults this to TCP. Left out of git, the live
+              # Rollout always differs from the render, so every Argo CD app
+              # stays OutOfSync.
+              protocol: TCP
+          env:
+            # The site + app are created and migrated by the entrypoint.
+            - name: SITE_NAME
+              value: frappe-gates-demo.local
+            - name: DB_HOST
+              value: frappe-gates-demo-mariadb
+            - name: DB_PORT
+              value: "3306"
+            - name: DB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: frappe-gates-demo
+                  key: db-root-password
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: frappe-gates-demo
+                  key: admin-password
+            - name: REDIS_CACHE_URL
+              value: redis://frappe-gates-demo-redis:6379/0
+            - name: REDIS_QUEUE_URL
+              value: redis://frappe-gates-demo-redis:6379/1
+            - name: REDIS_SOCKETIO_URL
+              value: redis://frappe-gates-demo-redis:6379/2
+            # Frappe needs a writable HOME for the bench CLI's caches.
+            - name: HOME
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: sites
+              mountPath: /home/frappe/frappe-bench/sites
+            - name: logs
+              mountPath: /home/frappe/frappe-bench/logs
+            - name: tmp
+              mountPath: /tmp
+          # Creating the site runs migrate for every doctype of the framework
+          # plus this app; on a cold node that is minutes, not seconds.
+          startupProbe:
+            httpGet:
+              path: /api/method/frappe_gates_demo.api.health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /api/method/frappe_gates_demo.api.health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/method/frappe_gates_demo.api.health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: sites
+          emptyDir:
+            sizeLimit: 512Mi
+        - name: logs
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

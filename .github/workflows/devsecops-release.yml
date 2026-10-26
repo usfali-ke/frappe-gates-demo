@@ -1,0 +1,247 @@
+# The release pipeline: every dynamic test runs against an environment
+# AFTER the new digest is deployed to it, never against a build. One run
+# walks the SDLC phases in order — the same signed digest all the way —
+# and a stage's phase sequence only starts when the previous environment
+# finished its own (its tests included). Each stage
+# (devsecops-stage.yml, one call per environment) runs the phases in
+# order, each ending at its control gate; a failed gate breaks the run
+# there — no later phase in the stage, and no later environment:
+#
+#   devsecops-pipeline (CI)    Plan → Develop ─ G1 ─ → Build ─ G2 ─ → Release
+#     └ starts this pipeline for the digest it published
+#   dev      Deliver (resolve, provenance, evidence, config) and Release
+#            (notes, rollback plan) in parallel → G5 → Deploy (GitOps +
+#            G6 admission on the cluster) → Test (smoke, integration,
+#            regression, security, DAST, dependency re-check) → G3
+#   staging  the same process as dev (smoke, e2e, regression, performance,
+#            security, DAST, TLS) → G3
+#   prod     the same process as dev and staging, plus exactly one job of
+#            its own before G5: `approve-prod`, the `release-approval`
+#            environment review → Deploy (canary, G6 admission) → Test
+#            (read-only smoke) → Monitor (health watch) → G6 gate → a
+#            failure starts the rollback
+#   Operate   rollback prod (automatic, on a failure after the deploy)
+#   Feedback  summary, PR comments, rollback command
+#
+# Dev, staging and prod are the same workflow (devsecops-stage.yml) with the
+# same gates and the same tests; only prod's approval differs, and the
+# release attaches no change request. A failed gate breaks the run there.
+#
+# Each stage passes the next the digest it deployed: staging and prod
+# refuse to run if the previous environment has moved on to a newer
+# release since.
+#
+# The pipeline starts a run at dev for every main commit it published.
+# Start one by hand at any stage (Actions → devsecops-release → Run
+# workflow): `start: staging` promotes what dev runs, `start: prod` what
+# staging runs; `kind: rollback` redeploys the start environment's previous
+# digest and stops there. Whoever started or re-ran a run, or authored the
+# change it carries, can't approve prod (approvals.sh, four-eyes).
+#
+# Waiting at an Approval Gate holds nothing up: a newer run's deploy to the
+# same environment waits for this one's (concurrency per environment in
+# devsecops-stage.yml), and if a newer run is already waiting there too,
+# GitHub cancels the older waiting run's deploy.
+
+name: devsecops-release
+run-name: >-
+  release ${{ inputs.commit && format('{0} ', inputs.commit) || '' }}from ${{ inputs.start }} (${{ inputs.kind }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: Stage to start from (dev = a main commit's image; staging/prod = what the previous environment runs)
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+        default: dev
+      kind:
+        description: Deployment kind (rollback = the start environment's digest before its last deploy, that stage only)
+        required: true
+        type: choice
+        options: [planned, hotfix, fix_forward, rollback]
+        default: planned
+      commit:
+        description: start dev only — the main commit whose image to deploy (default the commit this runs on)
+        required: false
+        type: string
+      allow-self-approval:
+        description: 'SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode): approve with the starter/author account. Opt-in per run; the waiver is recorded in the verdict detail.'
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  dev:
+    name: Dev · deploy + test (Dev)
+    if: github.ref == 'refs/heads/main' && inputs.start == 'dev'
+    uses: ./.github/workflows/devsecops-stage.yml
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: read
+      statuses: read
+      actions: read
+      issues: write
+      pull-requests: read
+    secrets:
+      # devsecops-stage.yml is a called workflow: repo secrets are not
+      # available inside it unless they are passed here. The deploy job
+      # reads exactly this one (the ruleset bypass for its push to main).
+      GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+    with:
+      environment: dev
+      kind: ${{ inputs.kind }}
+      commit: ${{ inputs.commit }}
+
+  staging:
+    name: Staging · deploy + test (Staging)
+    needs: dev
+    # Chained: only after dev deployed AND passed its tests (the stage
+    # fails otherwise). A rollback stays in the environment it started in.
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main' &&
+      (inputs.start == 'staging' || (inputs.start == 'dev' && inputs.kind != 'rollback' && needs.dev.result == 'success'))
+    uses: ./.github/workflows/devsecops-stage.yml
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: read
+      statuses: read
+      actions: read
+      issues: write
+      pull-requests: read
+    secrets:
+      # devsecops-stage.yml is a called workflow: repo secrets are not
+      # available inside it unless they are passed here. The deploy job
+      # reads exactly this one (the ruleset bypass for its push to main).
+      GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+    with:
+      environment: staging
+      kind: ${{ inputs.kind }}
+      expect-digest: ${{ needs.dev.outputs.digest }}
+
+  prod:
+    name: Production · deploy + test (Production)
+    needs: staging
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main' &&
+      (inputs.start == 'prod' || (inputs.start != 'prod' && inputs.kind != 'rollback' && needs.staging.result == 'success'))
+    uses: ./.github/workflows/devsecops-stage.yml
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: read
+      statuses: read
+      actions: read
+      issues: write
+      pull-requests: read
+    secrets:
+      # devsecops-stage.yml is a called workflow: repo secrets are not
+      # available inside it unless they are passed here. The deploy job
+      # reads exactly this one (the ruleset bypass for its push to main).
+      GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+    with:
+      environment: prod
+      kind: ${{ inputs.kind }}
+      expect-digest: ${{ needs.staging.outputs.digest }}
+      # prod's approval is the only approval in the pipeline, so this waiver
+      # only means something here.
+      allow-self-approval: ${{ inputs.allow-self-approval }}
+
+  rollback:
+    name: Operate · rollback prod (automatic)
+    # prod deployed and then failed its smoke tests or health watch (or
+    # Argo CD's G6): start the rollback right away. It redeploys the
+    # digest prod ran before (the deploy commit's Rollback-Digest) through
+    # the same gates, so it still waits for a release-approval reviewer:
+    # nothing reaches prod unapproved, but nobody has to work out what to
+    # roll back to. A failed canary never gets here: Argo Rollouts has
+    # already aborted it and prod still runs the old digest.
+    needs: prod
+    if: >-
+      always() && github.ref == 'refs/heads/main' && inputs.kind != 'rollback' &&
+      needs.prod.result == 'failure' && needs.prod.outputs.gitops-sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GITOPS_SHA: ${{ needs.prod.outputs.gitops-sha }}
+          SELF_APPROVAL: ${{ vars.ALLOW_SELF_APPROVAL }}
+        run: |
+          set -euo pipefail
+          args=(-f start=prod -f kind=rollback)
+          [ -z "${SELF_APPROVAL:-}" ] || args+=(-f "allow-self-approval=$SELF_APPROVAL")
+          gh workflow run devsecops-release.yml --repo "$GITHUB_REPOSITORY" --ref main "${args[@]}"
+          echo "prod failed after deploy ${GITOPS_SHA:0:7}: rollback started (devsecops-release, start prod, kind rollback); it waits for the prod approval" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  feedback:
+    name: Feedback · monitoring, logging & feedback
+    # Every run ends here, whatever happened: where the release got to,
+    # told to the people behind it (the pull requests merged as this
+    # release's commit) and, if
+    # a stage failed after it deployed, the rollback that undoes it. The
+    # dashboard gets the same from the artifacts (gate results, deployment
+    # events, release evidence) and Argo CD's notifications.
+    needs: [dev, staging, prod, rollback]
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: Summary + comments
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
+          KIND: ${{ inputs.kind }}
+          ROLLBACK: ${{ needs.rollback.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          icon() { case "$1" in success) echo "✅";; failure) echo "❌";; cancelled) echo "⏹";; *) echo "⏭";; esac; }
+          jobs=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" --jq '.jobs[]' | jq -s .)
+          source=$(jq -r '[.[].outputs["source-sha"] // empty | select(. != "")][0] // empty' <<<"$NEEDS")
+          digest=$(jq -r '[.[].outputs.digest // empty | select(. != "")][-1] // empty' <<<"$NEEDS")
+          rollback=""
+          table="| stage | result | digest | deploy commit | failed step |"$'\n'"|---|---|---|---|---|"
+          for env in dev staging prod; do
+            r=$(jq -r --arg e "$env" '.[$e].result' <<<"$NEEDS")
+            d=$(jq -r --arg e "$env" '.[$e].outputs.digest // ""' <<<"$NEEDS")
+            g=$(jq -r --arg e "$env" '.[$e].outputs["gitops-sha"] // ""' <<<"$NEEDS")
+            name=$(case "$env" in dev) echo "Dev · deploy + test (Dev)";; staging) echo "Staging · deploy + test (Staging)";; prod) echo "Production · deploy + test (Production)";; esac)
+            failed=$(jq -r --arg n "$name" '[.[] | select((.name | startswith($n + " / ")) and .conclusion == "failure") | .name | sub("^[^/]+/ "; "")] | join(", ")' <<<"$jobs")
+            table+=$'\n'"| ${name} | $(icon "$r") ${r} | ${d:+\`${d:0:19}…\`} | ${g:0:7} | ${failed} |"
+            # Deployed, then failed its checks: say how to go back.
+            if [ "$r" = failure ] && [ -n "$g" ] && [ "$env" = prod ] && [ "$ROLLBACK" = success ]; then
+              rollback+=$'\n'"- **prod** failed after deploy: the rollback run was started automatically and waits for \`release-approval\`"
+            elif [ "$r" = failure ] && [ -n "$g" ]; then
+              rollback+=$'\n'"- **${env}** runs a digest that failed after deploy: \`gh workflow run devsecops-release.yml --ref main -f start=${env} -f kind=rollback\`"
+            fi
+          done
+          body="### Release ${source:+${source:0:7} }(${KIND})${digest:+ · \`${digest:0:19}…\`} — [run](${RUN_URL})"$'\n\n'"${table}"
+          [ -z "$rollback" ] || body+=$'\n\n'"#### Rollback"$'\n'"Argo Rollouts already aborts a canary that fails its analysis. For a problem found after the rollout:${rollback}"
+          echo "$body" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$source" ] || exit 0
+          # The pull requests merged as this commit hear how far it got.
+          for pr in $(gh api "repos/${GITHUB_REPOSITORY}/commits/${source}/pulls" --jq '.[].number' 2>/dev/null); do
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" -f body="$body" > /dev/null || true
+          done

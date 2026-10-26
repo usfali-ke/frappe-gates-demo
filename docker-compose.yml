@@ -1,0 +1,51 @@
+# Local end-to-end stack: the app image plus the two services a Frappe site
+# needs. `docker compose up --build` gives a working site at
+# http://localhost:8000/api/method/frappe_gates_demo.api.health on a machine
+# with no bench installed.
+services:
+  mariadb:
+    image: mariadb:10.11
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MARIADB_ROOT_PASSWORD: frappe
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - mariadb-data:/var/lib/mysql
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    environment:
+      DB_HOST: mariadb
+      DB_PORT: "3306"
+      DB_ROOT_PASSWORD: frappe
+      REDIS_CACHE_URL: redis://redis:6379/0
+      REDIS_QUEUE_URL: redis://redis:6379/1
+      REDIS_SOCKETIO_URL: redis://redis:6379/2
+      SITE_NAME: frappe-gates-demo.local
+    ports:
+      - "8000:8000"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+
+volumes:
+  mariadb-data:
+  sites:
