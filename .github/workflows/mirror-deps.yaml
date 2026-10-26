@@ -60,10 +60,18 @@ jobs:
             docker push "${DEST}:${tag}"
           done
 
+      # Direct download, not sigstore/cosign-installer: with
+      # `cosign-release: v2.6.5` (the value devsecops-pipeline.yml uses and which
+      # works there) the action failed with "cosign versions below v2.0.0 are no
+      # longer supported. Requested version: v2.6.5" — the installer's own
+      # version parsing, not ours. The binary and the keyless flow are the same.
       - name: Install cosign
-        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
-        with:
-          cosign-release: v2.6.5
+        run: |
+          set -euo pipefail
+          curl -sSL -o /usr/local/bin/cosign \
+            https://github.com/sigstore/cosign/releases/download/v2.6.5/cosign-linux-amd64
+          chmod +x /usr/local/bin/cosign
+          cosign version
 
       - name: SBOM (syft) and SLSA v1 provenance for the mirrored digests
         env:
