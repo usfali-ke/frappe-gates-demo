@@ -17,9 +17,11 @@ build-backend = "flit_core.buildapi"
 
 # These dependencies are only installed when developer mode is enabled
 [tool.bench.dev-dependencies]
-# The test runner's --junit-xml-output path needs unittest-xml-reporting; the
-# pipeline's unit-test control reads that JUnit file (verdict.py tests).
-xmlrunner = "~=3.2"
+# Package names, not import names: the module is `xmlrunner`, the distribution
+# is unittest-xml-reporting (and PyPI's `xmlrunner` stops at 1.7.7). The test
+# runner's --junit-xml-output path needs it; the pipeline's unit-test control
+# reads that JUnit file.
+unittest-xml-reporting = "~=3.2"
 coverage = "~=7.6"
 
 # These apt dependencies will be installed from Ubuntu repositories when you host your app on Frappe Cloud
