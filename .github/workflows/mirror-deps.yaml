@@ -1,0 +1,53 @@
+# Mirror the two dependency images into the org's registry.
+#
+# Why: the cluster's restrict-image-registries policy (G6) allows only
+# ghcr.io/usfali-ke/* inside product namespaces, and frappe-gates-demo needs a
+# MariaDB and a Redis. Mirroring keeps the control intact instead of adding a
+# Docker Hub exception to it: after this runs, deploy/base/dependencies.yaml
+# points at these copies, digest-pinned like everything else.
+#
+# The mirror has to run here, not on an operator's laptop: pushing a package
+# needs write:packages, which this workflow's GITHUB_TOKEN has and a classic
+# PAT without that scope does not (GHCR answers "permission_denied: The token
+# provided does not match expected scopes").
+name: mirror-deps
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  SOURCE_MARIADB: docker.io/library/mariadb:10.11@sha256:bb27bde261794d326398a9c998ddf9f35db45296d829123bff829cd076f68107
+  SOURCE_REDIS: docker.io/library/redis:7-alpine@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
+  DEST: ghcr.io/usfali-ke/frappe-gates-demo-deps
+
+jobs:
+  mirror:
+    name: Mirror MariaDB and Redis into GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Copy both images
+        run: |
+          set -euo pipefail
+          for pair in "mariadb-10.11:${SOURCE_MARIADB}" "redis-7-alpine:${SOURCE_REDIS}"; do
+            tag="${pair%%:*}"; src="${pair#*:}"
+            echo "=== ${src} -> ${DEST}:${tag}"
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock quay.io/skopeo/stable:v1.16.1 \
+              copy --all --retry-times 3 "docker://${src}" "docker://${DEST}:${tag}"
+          done
+
+      - name: Report the digests to point the manifests at
+        run: |
+          set -euo pipefail
+          for tag in mariadb-10.11 redis-7-alpine; do
+            digest=$(docker run --rm quay.io/skopeo/stable:v1.16.1 inspect --format '{{.Digest}}' "docker://${DEST}:${tag}")
+            echo "${DEST}:${tag}@${digest}"
+            echo "- \`${DEST}:${tag}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
+          done
