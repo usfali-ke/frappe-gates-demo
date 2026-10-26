@@ -59,6 +59,10 @@ FILE_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^nuclei\.jsonl$"), "Nuclei Scan"),
     (re.compile(r"^dockle\.json$"), "Dockle Scan"),
     (re.compile(r"^bandit\.json$"), "Bandit Scan"),
+    # The Hermes AI security review's findings, written as SARIF by
+    # hermes_review.py (report-ai-review artifact) — the AI review is a
+    # scanner like any other, not just a PR comment.
+    (re.compile(r"^ai-review\.sarif$"), "SARIF"),
     (re.compile(r"^zap[-\w]*\.xml$"), "ZAP Scan"),
 ]
 # Recognised but not importable as-is: say so instead of failing silently.
