@@ -273,7 +273,18 @@ def build(dockerfile):
     if env("RC") != "0" or not d1 or not d2:
         ok, repro = False, "build failed"
     elif d1 != d2:
-        ok, repro = False, f"NOT reproducible: {d1[:19]} vs {d2[:19]} (two --no-cache builds)"
+        # REPRO_REQUIRED=0 records a measured mismatch as a finding instead of
+        # failing the control. Used where the CI builder itself is the
+        # nondeterministic part and the source has been shown to be
+        # reproducible elsewhere; the mismatch still reaches the evidence.
+        if env("REPRO_REQUIRED") == "0":
+            found("medium", "reproducible-build",
+                  f"two fresh builds of the same source produced {d1[:19]} and {d2[:19]}",
+                  blocking=False, where="Build · image (reproducible)",
+                  fix="deterministic builder or a fixed SOURCE_DATE_EPOCH; the digest comparison is recorded, not enforced, on this repo")
+            ok, repro = True, f"measured NOT reproducible: {d1[:19]} vs {d2[:19]} (recorded, REPRO_REQUIRED=0)"
+        else:
+            ok, repro = False, f"NOT reproducible: {d1[:19]} vs {d2[:19]} (two --no-cache builds)"
     else:
         ok, repro = True, f"reproducible: two --no-cache builds both {d1[:19]} (same runner)"
     return ok and bool(refs) and not bad, f"{repro}; {pins}", None
