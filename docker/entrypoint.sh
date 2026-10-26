@@ -116,5 +116,14 @@ bench --site "$SITE_NAME" set-config redis_cache "${REDIS_CACHE_URL:-redis://red
 bench --site "$SITE_NAME" set-config redis_queue "${REDIS_QUEUE_URL:-redis://redis:6379/1}" >/dev/null
 bench --site "$SITE_NAME" set-config redis_socketio "${REDIS_SOCKETIO_URL:-redis://redis:6379/2}" >/dev/null
 
+# A cache that outlives the build serves the PREVIOUS image's asset hashes:
+# `assets_json` holds the bundle filenames, and when the same Redis is reused
+# across deploys the page requests /assets/...<old-hash>.css, gets 404 and
+# renders unstyled (measured: the page asked for 357ROE7P while this image had
+# built EN2VUT6E). Clear it at boot so the hashes always come from the files
+# this container actually ships. Cheap and idempotent; every deploy has a cold
+# cache anyway.
+bench --site "$SITE_NAME" clear-cache >/dev/null
+
 echo "entrypoint: starting: $*"
 exec "$@"
