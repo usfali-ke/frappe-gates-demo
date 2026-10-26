@@ -41,21 +41,26 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      # docker pull/tag/push, not skopeo: skopeo asks GHCR for a cross-repo blob
+      # mount (library/mariadb -> this repo) and GHCR answers 403 on the token
+      # request, which reads as an auth failure but is the mount being refused.
+      # Docker pushes the blobs straight into the destination repo.
       - name: Copy both images
         run: |
           set -euo pipefail
           for pair in "dep-mariadb-10.11:${SOURCE_MARIADB}" "dep-redis-7-alpine:${SOURCE_REDIS}"; do
             tag="${pair%%:*}"; src="${pair#*:}"
             echo "=== ${src} -> ${DEST}:${tag}"
-            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock quay.io/skopeo/stable:v1.16.1 \
-              copy --all --retry-times 3 "docker://${src}" "docker://${DEST}:${tag}"
+            docker pull "${src}"
+            docker tag "${src}" "${DEST}:${tag}"
+            docker push "${DEST}:${tag}"
           done
 
       - name: Report the digests to point the manifests at
         run: |
           set -euo pipefail
           for tag in dep-mariadb-10.11 dep-redis-7-alpine; do
-            digest=$(docker run --rm quay.io/skopeo/stable:v1.16.1 inspect --format '{{.Digest}}' "docker://${DEST}:${tag}")
+            digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${DEST}:${tag}" | cut -d@ -f2)
             echo "${DEST}:${tag}@${digest}"
             echo "- \`${DEST}:${tag}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
           done
