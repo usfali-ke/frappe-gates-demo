@@ -18,6 +18,10 @@ metadata:
   name: frappe-gates-demo
   labels:
     app: frappe-gates-demo
+  annotations:
+    # Accepted, documented exceptions to the iac-checkov control:
+    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy is platform-owned; the products AppProject forbids product repos from shipping one
+    checkov.io/skip2: CKV_K8S_35=The only secrets are the database password and the site admin password, read once by the entrypoint; Frappe's site config has no file-based form for them
 spec:
   replicas: 2
   revisionHistoryLimit: 3
