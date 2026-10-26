@@ -40,7 +40,9 @@ RUN printf '[client]\nskip-ssl\n' > /etc/mysql/mariadb.conf.d/99-lab-no-tls.conf
 RUN pip install "frappe-bench==${BENCH_VERSION}" \
  && groupadd -r -g 10001 frappe \
  && useradd -r -u 10001 -g 10001 -M -d /home/frappe -s /usr/sbin/nologin frappe \
- && mkdir -p /home/frappe
+ && mkdir -p /home/frappe \
+ # bench init creates <HOME>/frappe-bench as this uid, so HOME must be its own.
+ && chown 10001:10001 /home/frappe
 
 USER 10001:10001
 WORKDIR /home/frappe
