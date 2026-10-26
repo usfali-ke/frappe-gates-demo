@@ -557,9 +557,14 @@ jobs:
       - id: repro
         name: Build twice, compare digests
         # SOURCE_DATE_EPOCH = commit time, timestamps rewritten, no BuildKit
-        # provenance/SBOM (they embed build time); the second build ignores
-        # the cache. Both on this runner: deterministic here, not proof an
-        # independent rebuilder gets the same bytes.
+        # provenance/SBOM (they embed build time). BOTH builds run --no-cache:
+        # a warm cache carries layer timestamps from an older
+        # SOURCE_DATE_EPOCH, so "cached == fresh" would compare two different
+        # clocks rather than two builds of the same source (measured on this
+        # repo: same epoch, warm cache vs --no-cache gave different digests;
+        # two fresh builds give the same one). Both on this runner:
+        # deterministic here, not proof an independent rebuilder gets the same
+        # bytes.
         run: |
           set -uo pipefail
           mkdir -p "$OUT"
@@ -568,7 +573,7 @@ jobs:
                   --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
                   --label "org.opencontainers.image.revision=${GITHUB_SHA}")
           rc=0
-          docker buildx build "${common[@]}" --output "type=oci,dest=image.oci.tar,rewrite-timestamp=true" --metadata-file "$OUT/build-1.json" . || rc=1
+          docker buildx build "${common[@]}" --no-cache --output "type=oci,dest=image.oci.tar,rewrite-timestamp=true" --metadata-file "$OUT/build-1.json" . || rc=1
           docker buildx build "${common[@]}" --no-cache --output "type=oci,dest=rebuild.oci.tar,rewrite-timestamp=true" --metadata-file "$OUT/build-2.json" . || rc=1
           { echo "rc=$rc"
             echo "d1=$(jq -r '."containerimage.digest" // empty' "$OUT/build-1.json" 2>/dev/null)"

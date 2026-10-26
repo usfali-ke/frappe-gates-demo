@@ -273,9 +273,9 @@ def build(dockerfile):
     if env("RC") != "0" or not d1 or not d2:
         ok, repro = False, "build failed"
     elif d1 != d2:
-        ok, repro = False, f"NOT reproducible: {d1[:19]} vs {d2[:19]} (cached vs --no-cache)"
+        ok, repro = False, f"NOT reproducible: {d1[:19]} vs {d2[:19]} (two --no-cache builds)"
     else:
-        ok, repro = True, f"reproducible: cached and --no-cache builds both {d1[:19]} (same runner)"
+        ok, repro = True, f"reproducible: two --no-cache builds both {d1[:19]} (same runner)"
     return ok and bool(refs) and not bad, f"{repro}; {pins}", None
 
 
