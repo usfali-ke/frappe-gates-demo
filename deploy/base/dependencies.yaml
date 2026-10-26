@@ -61,7 +61,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: mariadb
-          image: mariadb:10.11@sha256:bb27bde261794d326398a9c998ddf9f35db45296d829123bff829cd076f68107
+          # Mirrored from Docker Hub so the cluster's registry allowlist (G6,
+          # ghcr.io/usfali-ke/* only) stays strict rather than gaining an
+          # exception. Same digest as upstream: the mirror is a copy.
+          image: ghcr.io/usfali-ke/frappe-gates-demo:dep-mariadb-10.11@sha256:bb27bde261794d326398a9c998ddf9f35db45296d829123bff829cd076f68107
           imagePullPolicy: Always
           args:
             - --character-set-server=utf8mb4
@@ -171,7 +174,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: redis
-          image: redis:7-alpine@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
+          image: ghcr.io/usfali-ke/frappe-gates-demo:dep-redis-7-alpine@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
           imagePullPolicy: Always
           args: ["--save", "", "--appendonly", "no", "--maxmemory", "128mb"]
           ports:
