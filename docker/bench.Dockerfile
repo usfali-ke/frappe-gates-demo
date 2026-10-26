@@ -34,8 +34,12 @@ RUN apt-get update -qq \
 # Frappe bootstraps a new site by piping a schema dump through the mariadb CLI,
 # and Debian's client requires TLS by default while the lab MariaDB serves
 # plain TCP in-cluster. A real deployment keeps the TLS default.
-RUN printf '[client]\nskip-ssl\n' > /etc/mysql/mariadb.conf.d/99-lab-no-tls.conf 2>/dev/null || \
-    (mkdir -p /etc/mysql/mariadb.conf.d && printf '[client]\nskip-ssl\n' > /etc/mysql/mariadb.conf.d/99-lab-no-tls.conf)
+# NOTE the .cnf suffix: MariaDB's `!includedir` only takes files that end in
+# .cnf, and a `[client] skip-ssl` in a .conf name is silently ignored (measured:
+# the client then fails with "SSL is required, but the server does not support
+# it" while `mariadb --skip-ssl` on the same command line works).
+RUN mkdir -p /etc/mysql/mariadb.conf.d \
+ && printf '[client]\nskip-ssl\n' > /etc/mysql/mariadb.conf.d/99-lab-no-tls.cnf
 
 RUN pip install "frappe-bench==${BENCH_VERSION}" \
  && groupadd -r -g 10001 frappe \
@@ -57,9 +61,15 @@ RUN bench init \
  && find /home/frappe/frappe-bench -name "__pycache__" -prune -exec rm -rf {} +
 
 WORKDIR /home/frappe/frappe-bench
-# One site ships in this image: the app image pins it in wsgi_site.py.
-RUN printf 'frappe\n' > sites/apps.txt \
- && mkdir -p sites/assets logs
+# The app's registration and the pristine copy of sites/ live HERE, not in the
+# app image: every RUN layer in the app image is a chance for a timestamp to
+# differ between the cached and --no-cache builds (the reproducible-build
+# control compares image digests), so the app image is COPY-only.
+RUN printf 'frappe\nfrappe_gates_demo\n' > sites/apps.txt \
+ && printf '/home/frappe/frappe-bench/apps/frappe\n/home/frappe/frappe-bench/apps/frappe_gates_demo\n' \
+      > env/lib/python3.11/site-packages/frappe_apps.pth \
+ && mkdir -p sites/assets logs \
+ && cp -a sites /home/frappe/sites-template
 
 ENV HOME=/home/frappe \
     PYTHONPATH=/home/frappe/frappe-bench \
