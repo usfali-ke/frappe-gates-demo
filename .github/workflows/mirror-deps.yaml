@@ -18,6 +18,10 @@ on:
 permissions:
   contents: read
   packages: write
+  # Keyless signing: the mirrored images must satisfy the same G6 policy as the
+  # app image (signature + CycloneDX SBOM + SLSA provenance, keyless identity
+  # restricted to this repository's workflows), otherwise Argo's sync is denied
+  # by verify-image-signatures and the dependency pods never start.
 
 env:
   # Digest only: skopeo refuses "tag@digest" ("Docker references with both a tag
@@ -54,6 +58,54 @@ jobs:
             docker pull "${src}"
             docker tag "${src}" "${DEST}:${tag}"
             docker push "${DEST}:${tag}"
+          done
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.6.5
+
+      - name: SBOM (syft) and SLSA v1 provenance for the mirrored digests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mirror"
+          for tag in dep-mariadb-10.11 dep-redis-7-alpine; do
+            ref="${DEST}:${tag}"
+            digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" | cut -d@ -f2)
+            docker run --rm -e SYFT_CHECK_FOR_APP_UPDATE=false \
+              -v "$RUNNER_TEMP/mirror:/out" \
+              ghcr.io/anchore/syft:v1.27.0 "docker:${ref}" \
+              -o cyclonedx-json="/out/${tag}.cdx.json" -q
+            cat > "$RUNNER_TEMP/mirror/${tag}.slsa.json" <<JSON
+          {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "${ref}", "digest": {"sha256": "${digest#sha256:}"}}],
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {
+              "buildDefinition": {
+                "buildType": "https://github.com/usfali-ke/frappe-gates-demo/mirror-deps",
+                "externalParameters": {"source": "docker.io (digest-pinned upstream)", "workflow": "mirror-deps.yaml"}
+              },
+              "runDetails": {
+                "builder": {"id": "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"},
+                "metadata": {"invocationId": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"}
+              }
+            }
+          }
+          JSON
+          done
+
+      - name: Sign and attest both digests
+        run: |
+          set -euo pipefail
+          for tag in dep-mariadb-10.11 dep-redis-7-alpine; do
+            ref="${DEST}:${tag}"
+            digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" | cut -d@ -f2)
+            pinned="${DEST}@${digest}"
+            echo "=== signing ${pinned}"
+            cosign sign --yes "$pinned"
+            cosign attest --yes --type cyclonedx --predicate "$RUNNER_TEMP/mirror/${tag}.cdx.json" "$pinned"
+            cosign attest --yes --type slsaprovenance1 --predicate "$RUNNER_TEMP/mirror/${tag}.slsa.json" "$pinned"
           done
 
       - name: Report the digests to point the manifests at
