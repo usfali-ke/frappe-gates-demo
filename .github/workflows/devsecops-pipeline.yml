@@ -531,10 +531,11 @@ jobs:
     # under branch protection) and Build proceeds.
     if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
     runs-on: ubuntu-latest
-    # A Frappe bench build is minutes, not seconds; the double build has to fit.
-    timeout-minutes: 45
+    timeout-minutes: 30
     permissions:
       contents: read
+      # The bench base image on ghcr.io is private; the build stage must pull it.
+      packages: read
     outputs:
       digest: ${{ steps.repro.outputs.d1 }}
       result: ${{ steps.verdict.outputs.result }}
@@ -547,6 +548,12 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The base image (docker/bench.Dockerfile) is a private ghcr package.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - id: repro
         name: Build twice, compare digests
         # SOURCE_DATE_EPOCH = commit time, timestamps rewritten, no BuildKit

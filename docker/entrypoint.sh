@@ -27,10 +27,10 @@ cd "$BENCH_DIR"
 # A fresh volume mounted at sites/ is empty: restore the parts that ship with
 # the image (built assets, assets.json, apps.txt, the site-wide config) before
 # anything else runs. -n: never overwrite what the volume already holds.
-if [ ! -f sites/assets/assets.json ] && [ -d /opt/sites-template ]; then
+if [ ! -f sites/assets/assets.json ] && [ -d /home/frappe/sites-template ]; then
 	echo "entrypoint: seeding sites/ from the image template"
 	mkdir -p sites
-	cp -an /opt/sites-template/. sites/
+	cp -an /home/frappe/sites-template/. sites/
 fi
 
 # Redis and the site's switches come from the environment, never from a write
