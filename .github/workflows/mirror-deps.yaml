@@ -72,7 +72,11 @@ jobs:
           for tag in dep-mariadb-10.11 dep-redis-7-alpine; do
             ref="${DEST}:${tag}"
             digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$ref" | cut -d@ -f2)
+            # syft reads the image through the local daemon (the copy just pulled
+            # it), so the socket has to be mounted: without it syft exits 1 with
+            # no message beyond the pull progress.
             docker run --rm -e SYFT_CHECK_FOR_APP_UPDATE=false \
+              -v /var/run/docker.sock:/var/run/docker.sock \
               -v "$RUNNER_TEMP/mirror:/out" \
               ghcr.io/anchore/syft:v1.27.0 "docker:${ref}" \
               -o cyclonedx-json="/out/${tag}.cdx.json" -q
