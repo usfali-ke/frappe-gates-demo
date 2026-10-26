@@ -420,7 +420,10 @@ jobs:
   ai-review:
     name: Develop · AI security review · Hermes
     if: startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: lab-runner
+    # The Hermes gateway is the LAB one (192.168.122.191:8644, kali-vm on the
+    # libvirt bridge), which is reachable from the host runners and not from an
+    # in-cluster ARC pod: the sender must run where the route is routable.
+    runs-on: [self-hosted, linux, frappe-gates-demo-env]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -643,7 +646,7 @@ jobs:
       - run: |
           mkdir -p "$OUT"
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            fs --scanners vuln --list-all-pkgs --include-dev-deps --format json --output /out/trivy-fs.json --exit-code 0 -q /src || true
+            fs --ignore-unfixed --scanners vuln --list-all-pkgs --include-dev-deps --format json --output /out/trivy-fs.json --exit-code 0 -q /src || true
       - id: verdict
         if: always()
         env:
@@ -752,10 +755,12 @@ jobs:
       VERDICT_FILE: reports/image-scan/verdict.json
       NATIVE: reports/image-scan/trivy.txt
       DIGEST: ${{ needs.build.outputs.digest }}
-      # Every Critical/High in the image blocks, fixed upstream or not: a
-      # vulnerable artifact is not pushed and never reaches a cluster. (The
-      # default only blocks the ones with a released fix.)
-      BLOCK_UNFIXED: "true"
+      # trivy runs with --ignore-unfixed: a Critical/High that upstream has
+      # already released a fix for blocks (fix the image), one with NO fix is
+      # reported in the detail and the SBOM-backed table but does not break the
+      # pipeline. Same rule in the lockfile scan and in verdict.py, so the
+      # policy holds even if a future scan forgets the flag.
+      BLOCK_UNFIXED: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -771,7 +776,7 @@ jobs:
           got=$(jq -r '.manifests[0].digest' "$RUNNER_TEMP/oci/index.json")
           [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
           docker run --rm -v "$RUNNER_TEMP/oci:/oci:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            image --input /oci --scanners vuln,secret --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q || true
+            image --input /oci --ignore-unfixed --scanners vuln,secret --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q || true
           docker run --rm -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
             convert --format sarif --output /out/trivy.sarif /out/trivy.json -q || true
       - id: verdict

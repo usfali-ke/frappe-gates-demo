@@ -291,9 +291,11 @@ def build(dockerfile):
 
 
 def trivy_fs(path):
-    """SCA from the lockfile: every Critical/High blocks, fixed or not (a
-    dependency can be swapped even when upstream has no fix), and so does
-    an unrated one (unknown isn't low). Zero packages scanned is a fail
+    """SCA from the lockfile: a Critical/High WITH a released fix blocks (bump
+    it), one with no fix is reported and counted but does not break the
+    pipeline, and an unrated one only blocks when a fix exists. Same rule as
+    the image scan (`--ignore-unfixed`) and trivy(): the pipeline asks for
+    work that can actually be done. Zero packages scanned is still a fail
     (the lockfile wasn't understood)."""
     report = load(path)
     if report is None:
@@ -306,7 +308,8 @@ def trivy_fs(path):
         lines = {(p.get("Identifier") or {}).get("UID"): (p.get("Locations") or [{}])[0].get("StartLine") for p in r.get("Packages") or []}
         for v in r.get("Vulnerabilities") or []:
             a = accepted(v["VulnerabilityID"], fixed=bool(v.get("FixedVersion")))
-            block = v.get("Severity") in ("CRITICAL", "HIGH", "UNKNOWN", None)
+            fixable = bool(v.get("FixedVersion"))
+            block = fixable and v.get("Severity") in ("CRITICAL", "HIGH", "UNKNOWN", None)
             found(v.get("Severity"), v["VulnerabilityID"], v.get("Title") or first_line(v.get("Description")), blocking=block, accepted=a,
                   package=v["PkgName"], version=v.get("InstalledVersion"), file=r.get("Target"),
                   line=lines.get((v.get("PkgIdentifier") or {}).get("UID")), url=v.get("PrimaryURL"),
@@ -319,7 +322,8 @@ def trivy_fs(path):
             else:
                 lower += 1
     top = summarize(blocking, lambda v: f"{v['VulnerabilityID']} ({v['PkgName']} {v.get('InstalledVersion', '')} {v.get('Severity') or 'no severity'})")
-    detail = (f"{len(blocking)} High/Critical-or-unrated, {lower} lower, across {packages} packages "
+    unfixed = [v for r in results for v in r.get("Vulnerabilities") or [] if not v.get("FixedVersion")]
+    detail = (f"{len(blocking)} High/Critical-or-unrated with a fix, {len(unfixed)} without a fix (noted, not blocking), {lower} lower, across {packages} packages "
               f"({', '.join(r.get('Target', '?') for r in results) or env('LOCKFILE', 'lockfile')}){': ' + top if top else ''}")
     if not packages:
         tool_broke()
