@@ -101,23 +101,38 @@ jobs:
               "docker-archive:/data/${tag}.tar" \
               -q -o cyclonedx-json="/data/${tag}.cdx.json"
             rm -f "$RUNNER_TEMP/mirror/${tag}.tar"
-            cat > "$RUNNER_TEMP/mirror/${tag}.slsa.json" <<JSON
-          {
-            "_type": "https://in-toto.io/Statement/v1",
-            "subject": [{"name": "${ref}", "digest": {"sha256": "${digest#sha256:}"}}],
-            "predicateType": "https://slsa.dev/provenance/v1",
-            "predicate": {
-              "buildDefinition": {
-                "buildType": "https://github.com/usfali-ke/frappe-gates-demo/mirror-deps",
-                "externalParameters": {"source": "docker.io (digest-pinned upstream)", "workflow": "mirror-deps.yaml"}
+            # Written by python, not a heredoc: the previous attempt produced a
+            # statement cosign rejected with "required field buildDefinition
+            # missing", which is what a shell-expanded, indented heredoc looks
+            # like once it is half-parsed.
+            python3 - "$ref" "$digest" "$RUNNER_TEMP/mirror/${tag}.slsa.json" <<'PY'
+          import json, os, sys
+
+          ref, digest, path = sys.argv[1], sys.argv[2].split(":", 1)[1], sys.argv[3]
+          run = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          statement = {
+              "_type": "https://in-toto.io/Statement/v1",
+              "subject": [{"name": ref, "digest": {"sha256": digest}}],
+              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicate": {
+                  "buildDefinition": {
+                      "buildType": "https://actions.github.io/buildtypes/workflow/v1",
+                      "externalParameters": {
+                          "workflow": {"ref": "refs/heads/main", "path": ".github/workflows/mirror-deps.yaml"},
+                          "source": "docker.io (digest-pinned upstream copy)",
+                      },
+                      "internalParameters": {"repository": os.environ["GITHUB_REPOSITORY"]},
+                      "resolvedDependencies": [{"uri": f"pkg:docker/{ref}"}],
+                  },
+                  "runDetails": {
+                      "builder": {"id": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"},
+                      "metadata": {"invocationId": run},
+                  },
               },
-              "runDetails": {
-                "builder": {"id": "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"},
-                "metadata": {"invocationId": "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"}
-              }
-            }
           }
-          JSON
+          with open(path, "w") as fh:
+              json.dump(statement, fh, indent=2)
+          PY
           done
 
       - name: Sign and attest both digests
