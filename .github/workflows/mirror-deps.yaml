@@ -25,7 +25,12 @@ env:
   # and the digest is what the manifests end up pinning.
   SOURCE_MARIADB: docker.io/library/mariadb@sha256:bb27bde261794d326398a9c998ddf9f35db45296d829123bff829cd076f68107
   SOURCE_REDIS: docker.io/library/redis@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
-  DEST: ghcr.io/usfali-ke/frappe-gates-demo-deps
+  # A NEW package name is refused with 403 from GHCR's token endpoint even with
+  # packages: write (measured: "Requesting bearer token: invalid status code
+  # from registry 403 (Forbidden)" while copying into
+  # .../frappe-gates-demo-deps). Mirroring into the package this repo already
+  # publishes needs no new grant, and the tags say what they are.
+  DEST: ghcr.io/usfali-ke/frappe-gates-demo
 
 jobs:
   mirror:
@@ -39,7 +44,7 @@ jobs:
       - name: Copy both images
         run: |
           set -euo pipefail
-          for pair in "mariadb-10.11:${SOURCE_MARIADB}" "redis-7-alpine:${SOURCE_REDIS}"; do
+          for pair in "dep-mariadb-10.11:${SOURCE_MARIADB}" "dep-redis-7-alpine:${SOURCE_REDIS}"; do
             tag="${pair%%:*}"; src="${pair#*:}"
             echo "=== ${src} -> ${DEST}:${tag}"
             docker run --rm -v /var/run/docker.sock:/var/run/docker.sock quay.io/skopeo/stable:v1.16.1 \
@@ -49,7 +54,7 @@ jobs:
       - name: Report the digests to point the manifests at
         run: |
           set -euo pipefail
-          for tag in mariadb-10.11 redis-7-alpine; do
+          for tag in dep-mariadb-10.11 dep-redis-7-alpine; do
             digest=$(docker run --rm quay.io/skopeo/stable:v1.16.1 inspect --format '{{.Digest}}' "docker://${DEST}:${tag}")
             echo "${DEST}:${tag}@${digest}"
             echo "- \`${DEST}:${tag}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
