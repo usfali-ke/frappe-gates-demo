@@ -50,16 +50,35 @@ RUN pip install "frappe-bench==${BENCH_VERSION}" \
 
 USER 10001:10001
 WORKDIR /home/frappe
-# Assets are built here (bench init runs `bench build`), so the app image never
-# needs node.
+# Assets are built here (bench init runs `bench build`), so nothing below is
+# needed at runtime — and this is where the image scan's 1248 Critical/High
+# came from: 1071 were `stdlib` (the Go runtime inside Node/esbuild binaries)
+# plus npm packages (postcss, brace-expansion, minimatch, loader-utils) that
+# only exist to BUILD the bundles. `bench build` already wrote sites/assets,
+# so the toolchain and the module trees are dropped. The app image therefore
+# ships a runtime, not a build machine. (Verified: bench migrate and gunicorn
+# serve the site with node absent.)
 RUN bench init \
       --frappe-branch "${FRAPPE_VERSION}" \
       --skip-redis-config-generation \
       --python python3.11 \
       frappe-bench \
+ && find /home/frappe/frappe-bench -type d -name node_modules -prune -exec rm -rf {} + \
  && find /home/frappe/frappe-bench/apps -name .git -prune -exec rm -rf {} + \
- && find /home/frappe/frappe-bench -name "__pycache__" -prune -exec rm -rf {} +
+ && find /home/frappe/frappe-bench -name "__pycache__" -prune -exec rm -rf {} + \
+ && rm -rf /home/frappe/.cache /home/frappe/.npm /home/frappe/.yarn /home/frappe/.esbuild
 
+# node/yarn/npm are build-only. Purged as root: the packages were installed by
+# apt and npm, and removing the binaries also removes esbuild's Go runtime and
+# the npm toolchain's own dependency tree from the scanned filesystem.
+USER root
+RUN apt-get purge -y nodejs >/dev/null \
+ && apt-get autoremove -y >/dev/null \
+ && rm -rf /usr/lib/node_modules /usr/local/lib/node_modules /usr/local/share/.cache/yarn \
+           /root/.npm /root/.cache /home/frappe/.cache \
+           /usr/bin/node /usr/bin/yarn /usr/local/bin/yarn /usr/local/bin/yarnpkg \
+ && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+USER 10001:10001
 WORKDIR /home/frappe/frappe-bench
 # The app's registration and the pristine copy of sites/ live HERE, not in the
 # app image: every RUN layer in the app image is a chance for a timestamp to
