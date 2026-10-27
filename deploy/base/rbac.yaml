@@ -1,0 +1,52 @@
+# What the post-deploy test harness is allowed to do, and nothing else.
+#
+# tests/env/env-up.sh reaches the running environment from a self-hosted
+# runner: it lists pods to find the rollout's pod, forwards a local port to it
+# (TLS is terminated by Caddy in front of that port) and can exec into the pod
+# for the log assertions. That is the whole permission set.
+#
+# Two subjects are bound because the environment runners are shared by the
+# product repos and each repo's installer mints its own service account token:
+#   - frappe-gates-demo-tools/env-tester  (tests/env/env-runner.sh in this repo)
+#   - django-gates-demo-tools/env-tester  (the same script in django-gates-demo)
+# A runner holding either token can then serve any product's stage pipeline.
+# Without the second binding the dev test jobs fail with:
+#   pods is forbidden: User "system:serviceaccount:django-gates-demo-tools:env-tester"
+#   cannot list resource "pods" in the namespace "frappe-gates-demo-dev"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: env-tester
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/portforward", "pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: env-tester
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: env-tester
+subjects:
+  - kind: ServiceAccount
+    name: env-tester
+    namespace: frappe-gates-demo-tools
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: env-tester-django
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: env-tester
+subjects:
+  - kind: ServiceAccount
+    name: env-tester
+    namespace: django-gates-demo-tools
