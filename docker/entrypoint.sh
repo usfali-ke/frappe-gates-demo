@@ -22,6 +22,15 @@ APP="${APP:-frappe_gates_demo}"
 # a new password — "Access denied for user _fb8d00a034cf6693". Same rule as the
 # check, applied in one place.
 DB_NAME="$(printf '%s' "$SITE_NAME" | tr -c '0-9a-zA-Z' '_' | tr 'A-Z' 'a-z')"
+# ...and the pod is part of the name. During a canary two pods run at once, each
+# with its own (emptyDir) site directory but against the SAME MariaDB: with one
+# derived name the canary's bootstrap dropped the database the stable pod was
+# serving ("Access denied for user 'frappe_gates_demo_local'@'10.244.0.79'"), and
+# the canary failed its own migrate with the same error. A per-pod database is
+# the honest model for an ephemeral site volume; a deployment that keeps data
+# uses a PVC and one writer instead.
+POD_SUFFIX="$(printf '%s' "${HOSTNAME:-local}" | tr -c '0-9a-zA-Z' '_' | tail -c 9)"
+DB_NAME="${DB_NAME}_${POD_SUFFIX}"
 
 if [ -z "$DB_ROOT_PASSWORD" ]; then
 	echo "entrypoint: DB_ROOT_PASSWORD is required" >&2
