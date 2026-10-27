@@ -16,6 +16,12 @@ DB_ROOT_USER="${DB_ROOT_USER:-root}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 APP="${APP:-frappe_gates_demo}"
+# The database name is DERIVED, not Frappe's default: without --db-name Frappe
+# invents _<hash>, which the orphan check below cannot see, so a second pod
+# (fresh emptyDir, same MariaDB) reused a database whose user it had just given
+# a new password — "Access denied for user _fb8d00a034cf6693". Same rule as the
+# check, applied in one place.
+DB_NAME="$(printf '%s' "$SITE_NAME" | tr -c '0-9a-zA-Z' '_' | tr 'A-Z' 'a-z')"
 
 if [ -z "$DB_ROOT_PASSWORD" ]; then
 	echo "entrypoint: DB_ROOT_PASSWORD is required" >&2
@@ -83,9 +89,20 @@ with conn.cursor() as cur:
     raise SystemExit(0 if cur.fetchone() else 1)
 PY
 	then
-		echo "entrypoint: ${SITE_NAME} has no site_config.json but database '$SITE_NAME' exists;" >&2
-		echo "entrypoint: restore the site volume or drop the database — the pair cannot be rebuilt separately" >&2
-		exit 1
+		# The site directory is the pod's own emptyDir, so a database with this
+		# name can only be an orphan from a previous pod (the same MariaDB
+		# persists across pods). Frappe names such a database _<hash> unless
+		# --db-name is given, which is why the guard above never saw it and the
+		# next pod died with "Access denied for user _fb8d00a034cf6693" — it
+		# generated a fresh password for a user the old pod had created.
+		# Drop the orphan and bootstrap cleanly.
+		echo "entrypoint: database ${DB_NAME} exists without a site (orphan from a previous pod); dropping it"
+		MYSQL_PWD="$DB_ROOT_PASSWORD" mariadb --host "$DB_HOST" --port "$DB_PORT" \
+			--user "$DB_ROOT_USER" --skip-ssl \
+			-e "DROP DATABASE IF EXISTS \`${DB_NAME}\`" || {
+			echo "entrypoint: could not drop ${DB_NAME}" >&2
+			exit 1
+		}
 	fi
 	# A volume mounted at the site path makes Docker/Kubernetes create the
 	# directory itself; Frappe's new-site refuses an existing directory even
@@ -95,6 +112,7 @@ PY
 	echo "entrypoint: creating site ${SITE_NAME}"
 	# --no-mariadb-socket: pymysql over TCP, so the image needs no socket path.
 	bench new-site "$SITE_NAME" \
+		--db-name "$DB_NAME" \
 		--db-host "$DB_HOST" --db-port "$DB_PORT" \
 		--mariadb-root-username "$DB_ROOT_USER" \
 		--mariadb-root-password "$DB_ROOT_PASSWORD" \
