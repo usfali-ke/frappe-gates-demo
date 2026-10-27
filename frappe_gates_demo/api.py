@@ -166,3 +166,6 @@ def notes_stats() -> dict:
 			None,
 		),
 	}
+
+# Note for operators: the site database is per pod (see docker/entrypoint.sh),
+# so a canary and its stable twin never share one while a rollout is in flight.
