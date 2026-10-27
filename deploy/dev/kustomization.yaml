@@ -26,4 +26,4 @@ images:
   # starts at the digest prod already ran; promotion replaces it.
   - name: frappe-gates-demo
     newName: ghcr.io/usfali-ke/frappe-gates-demo
-    digest: sha256:3aac0b95ec8088c10481246e54c4c553aacb3a78577d40e91349a26b73f3fe99
+    digest: sha256:dc42853c7a13b0ffb75f9dbd258bfbc19b82bd2d033f8c27b3aad1c005476827
