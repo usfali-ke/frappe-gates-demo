@@ -1077,9 +1077,20 @@ jobs:
           set -uo pipefail
           mkdir -p "$OUT"
           context="security-dashboard/G6/${TARGET_ENV}"
+          # Statuses live on the commit, not on a deployment: if this revision was
+          # deployed before (a retry, or a digest re-promoted to an environment
+          # that already ran it), the dashboard's OLD verdict for it is still
+          # there — including a failure recorded while the app was degraded. The
+          # first prod promotion failed exactly this way: it read a 4-hour-old
+          # `G6/prod failure` (health_checks_green, automatic_rollback) that
+          # predated the deploy, 20 seconds into its poll. Only statuses created
+          # after this deploy commit existed can describe this deploy.
+          since=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITOPS_SHA}" \
+                    --jq '.commit.committer.date' 2>/dev/null || true)
+          echo "accepting ${context} statuses created at or after ${since:-any time}" >&2
           for _ in $(seq 90); do
             s=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITOPS_SHA}/statuses?per_page=100" \
-                  --jq "[.[] | select(.context == \"${context}\")][0] // empty" 2>/dev/null)
+                  --jq "[.[] | select(.context == \"${context}\" and .created_at >= \"${since}\")][0] // empty" 2>/dev/null)
             state=$(jq -r '.state // empty' <<<"${s:-null}")
             desc=$(jq -r '.description // ""' <<<"${s:-null}")
             if [ "$state" = success ] || [ "$state" = failure ] || [ "$state" = error ]; then
