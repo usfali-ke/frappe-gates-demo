@@ -10,8 +10,15 @@
 #
 # The runner dir holds an unpacked actions/runner release (default
 # ~/actions-runner-env). The runner runs as the env-tester ServiceAccount,
-# with a 2-hour token in a kubeconfig only this user can read; GH_TOKEN
-# (repo admin) is used for the registration token and not passed on.
+# with a token in a kubeconfig only this user can read; GH_TOKEN (repo
+# admin) is used for the registration token and not passed on.
+#
+# The token is NOT a `kubectl create token --duration=2h` TokenRequest. That
+# expires, and a long-lived runner then fails every post-deploy job with
+# "error: You must be logged in to the server (Unauthorized)" — which is
+# indistinguishable from a permissions problem until you read kubectl's
+# stderr. It reads the durable service-account-token Secret instead, created
+# once here and never rotated by time.
 set -euo pipefail
 
 repo=usfali-ke/frappe-gates-demo
@@ -21,7 +28,30 @@ kubeconfig=$HOME/.kube/env-tester.json
 [ -x "$dir/config.sh" ] || { echo "no actions runner in $dir" >&2; exit 1; }
 
 mkdir -p "$(dirname "$kubeconfig")"
-token=$(kubectl -n frappe-gates-demo-tools create token env-tester --duration=2h)
+# Durable token Secret (k8s >= 1.24 no longer auto-creates one for a
+# ServiceAccount). It lives as long as the Secret does, so a runner can stay
+# registered for weeks.
+sa_ns=frappe-gates-demo-tools
+sa=env-tester
+if ! kubectl -n "$sa_ns" get secret "${sa}-token" >/dev/null 2>&1; then
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${sa}-token
+  namespace: ${sa_ns}
+  annotations:
+    kubernetes.io/service-account.name: ${sa}
+type: kubernetes.io/service-account-token
+EOF
+fi
+# The token controller fills .data.token asynchronously.
+for _ in $(seq 30); do
+  token=$(kubectl -n "$sa_ns" get secret "${sa}-token" -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+  [ -n "$token" ] && break
+  sleep 2
+done
+[ -n "${token:-}" ] || { echo "no token in ${sa_ns}/${sa}-token" >&2; exit 1; }
 # umask in a subshell only: the runner's checkouts must stay readable by
 # the tool containers (cap-drop ALL: root there can't override modes).
 (umask 077; kubectl config view --minify --raw -o json \
