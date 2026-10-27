@@ -6,6 +6,7 @@ kind: Kustomization
 
 resources:
   - dependencies.yaml
+  - rbac.yaml
   - services.yaml
   - analysistemplate.yaml
   - rollout.yaml
