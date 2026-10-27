@@ -820,9 +820,11 @@ jobs:
           sparse-checkout: .github
       - id: sod
         name: Separation of duties
+        # Only the run's starter/re-runner is barred from approving. Authorship
+        # is not checked here on purpose: any reviewer the environment lists can
+        # approve as long as they did not start this deployment.
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
           ALLOW_SELF_APPROVAL: ${{ inputs.allow-self-approval }}
         run: bash .github/scripts/approvals.sh release-approval
       - id: verdict

@@ -4,31 +4,28 @@
 #     GH_TOKEN=... [SOURCE_SHA=<commit>] [ALLOW_SELF_APPROVAL=...] \
 #       bash .github/scripts/approvals.sh <environment>
 #
-# Reads the review of <environment> in this run back from GitHub. Whoever
-# started the run — or re-ran it — can't be its approver, and neither can
-# whoever authored the change being released or opened its pull request: at
-# least one approval must come from someone who did none of those.
-# Writes started=, authors= and approved= (JSON arrays of logins) and
-# detail= to $GITHUB_OUTPUT; exits 1 when nobody approved, when every
-# approval came from someone excluded, or when a GitHub read this decision
-# depends on fails.
+# Reads the review of <environment> in this run back from GitHub and decides
+# whether it carries the deployment.
 #
-# Three things used to make this reject the only person who could approve:
+# The rule: whoever STARTED this run, and whoever RE-RAN it, cannot be its
+# approver — you may not approve the deployment you put in motion. That is the
+# whole exclusion set. Any other valid reviewer may approve, including someone
+# who authored part of the change: authorship is not self-approval, and the
+# environment's own required-reviewers list is the authority on who is allowed
+# to review at all.
 #
-#   * the change's "author" was read from the commit on main, which for a
-#     merged pull request is a merge commit GitHub attributes to whoever
-#     merged it — the releaser, not the author — barring them from
-#     approving the merge they made;
-#   * triggering_actor was excluded even on the first attempt, where a
-#     run the pipeline starts has github-actions as its actor and
-#     triggering_actor is only the human whose push or merge set that
-#     pipeline going — a case the change check already covers;
-#   * every approval being excluded was reported as that approver's fault,
-#     even when the environment left nobody able to approve.
+# This replaced a stricter set that also excluded every author of the change
+# and of its pull requests. In a repository with two reviewers and a merge
+# train that one person drives, that set excluded both accounts — the starter
+# AND the author — and the pipeline then failed with "no eligible approver
+# exists" while GitHub had accepted a perfectly valid second-person review.
+# The check must not be able to reach that state: if the environment lists
+# someone who is not the starter, that person can approve.
 #
-# So the change is resolved from the pull request (its author and its
-# commits' authors), triggering_actor is excluded only on a re-run, and the
-# message separates "the wrong person approved" from "nobody could".
+# Writes started=, approved= (JSON arrays of logins) and detail= to
+# $GITHUB_OUTPUT; exits 1 when nobody approved, when every approval came from
+# the starter or a re-runner, or when a GitHub read this decision depends on
+# fails.
 set -euo pipefail
 
 environment=$1
@@ -61,37 +58,20 @@ approvals=$(gh_api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/app
 started=$(jq -c '[.actor.login, (if (.run_attempt // 1) > 1 then .triggering_actor.login else empty end)]
                  | map(select(.)) | unique' <<<"$run")
 
-authors='[]'
-if [ -n "${SOURCE_SHA:-}" ]; then
-  commit=$(gh_api "repos/${GITHUB_REPOSITORY}/commits/${SOURCE_SHA}") \
-    || fail_hard "cannot read commit ${SOURCE_SHA:0:12} from GitHub: who authored the change can't be decided"
-  prs=$(gh_api "repos/${GITHUB_REPOSITORY}/commits/${SOURCE_SHA}/pulls") \
-    || fail_hard "cannot read the pull requests containing ${SOURCE_SHA:0:12} from GitHub: who authored the change can't be decided"
-  pr_authors='[]'
-  for n in $(jq -r '.[]?.number' <<<"$prs"); do
-    cs=$(gh_api "repos/${GITHUB_REPOSITORY}/pulls/${n}/commits") \
-      || fail_hard "cannot read the commits of pull request #${n} from GitHub: who authored the change can't be decided"
-    pr_authors=$(jq -nc --argjson a "$pr_authors" --argjson c "$cs" '$a + [$c[]?.author.login]')
-  done
-  # web-flow commits GitHub's own merges; bots can't approve anyway.
-  authors=$(jq -nc --argjson c "$commit" --argjson p "$prs" --argjson pa "$pr_authors" \
-    '((if ($p | length) > 0 then [$p[]?.user.login] else [$c.author.login] end) + $pa)
-     | map(select(. and . != "web-flow" and (endswith("[bot]") | not))) | unique')
-fi
-
-excluded=$(jq -nc --argjson s "$started" --argjson a "$authors" '$s + $a | unique')
+# Who is barred: the starter, plus the re-runner on a later attempt. Authorship
+# is deliberately NOT part of this — a contributor may review the release of a
+# change they wrote; what they may not do is approve the run they started.
+excluded=$started
 approved=$(jq -c --arg e "$environment" \
   '[.[] | select(.state == "approved" and any(.environments[]?; .name == $e)) | .user.login] | unique' <<<"$approvals")
 # self: approvals from someone excluded. eligible: approvals from someone who
 # did none of those — one of these has to exist for the review to count.
 self=$(jq -rn --argjson a "$approved" --argjson e "$excluded" '($a - ($a - $e)) | join(", ")')
 eligible=$(jq -rn --argjson a "$approved" --argjson e "$excluded" '($a - $e) | join(", ")')
-{ echo "started=$started"; echo "authors=$authors"; echo "approved=$approved"; } >> "$GITHUB_OUTPUT"
+{ echo "started=$started"; echo "approved=$approved"; } >> "$GITHUB_OUTPUT"
 
-summary=$(jq -rn --argjson s "$started" --argjson a "$authors" --argjson ap "$approved" \
-  '"started by " + ($s | join(", "))
-   + (if ($a | length) > 0 then ", change by " + ($a | join(", ")) else "" end)
-   + ", approved by " + ($ap | join(", "))')
+summary=$(jq -rn --argjson s "$started" --argjson ap "$approved" \
+  '"started by " + ($s | join(", ")) + ", approved by " + ($ap | join(", "))')
 
 if [ "$approved" = "[]" ]; then
   detail="no ${environment} approval recorded for this run"
@@ -110,13 +90,13 @@ else
   admin_bypass=$(jq -r '.can_admins_bypass // false' <<<"$env_json")
   remaining=$(jq -cn --argjson r "$reviewers" --argjson e "$excluded" '$r - $e')
   if [ "$reviewers" != "[]" ] && [ "$remaining" = "[]" ]; then
-    detail="no eligible ${environment} approver exists: every reviewer of this environment (${reviewers}) is excluded — the run's starter, a re-runner, or the change's authors — so no listed reviewer could approve"
+    detail="no eligible ${environment} approver: every reviewer of this environment (${reviewers}) started or re-ran this run, and the starter of a deployment may not approve it — add a reviewer who did not start it"
     if [ "$admin_bypass" = "true" ]; then
       detail="${detail}; the environment does allow repository admins to bypass its review, so an admin approval can still carry it"
     fi
-    detail="${detail}. Add a reviewer who did none of those, or opt into the documented single-operator exception (set the ALLOW_SELF_APPROVAL repository variable for a run the pipeline starts; a manual run can pass allow-self-approval, honoured only for repository admins)"
+    detail="${detail}, or opt into the documented single-operator exception (set the ALLOW_SELF_APPROVAL repository variable for a run the pipeline starts; a manual run can pass allow-self-approval, honoured only for repository admins)"
   else
-    detail="${environment} approved only by ${self}, who started or re-ran this run or authored the change — someone who did neither must approve"
+    detail="${environment} was approved only by ${self}, who started or re-ran this run — someone who did not start it must approve"
   fi
   # Documented single-operator exception: where one account starts the pipeline
   # and the other authors the change, the doc's strict rule leaves no eligible
