@@ -152,23 +152,10 @@ jobs:
             cosign attest --yes --type slsaprovenance1 --predicate "$RUNNER_TEMP/mirror/${tag}.slsa.json" "$pinned"
           done
 
-      # Kyverno verifies signatures by pulling them from the registry with no
-      # credentials (this build has no imagePullSecrets on verifyImages — it
-      # rejects the field), and a private package makes that read fail with
-      # "GET https://ghcr.io/token... DENIED: denied". Public packages are the
-      # supported way to let the policy verify; the images carry no secrets.
-      - name: Make the package public so signature verification can read it
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          code=$(curl -s -o /tmp/vis.json -w '%{http_code}' -X PATCH \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/user/packages/container/frappe-gates-demo \
-            -d '{"visibility":"public"}')
-          echo "visibility PATCH -> ${code}"
-          [ "${code}" = "204" ] || { cat /tmp/vis.json; exit 1; }
+      # No visibility step: /user/packages/... answers 404 to an installation
+      # token (it needs a PAT), and it is not needed — the package already
+      # answers anonymous token requests, which is how Kyverno reads
+      # signatures (verified: the app image's attestations pass admission).
 
       - name: Report the digests to point the manifests at
         run: |
