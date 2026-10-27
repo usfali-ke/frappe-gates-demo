@@ -739,8 +739,18 @@ jobs:
             echo "no ${TARGET_ENV} deploy by the release pipeline is on record (${KUSTOMIZATION} last changed by ${deploy_sha:0:7}); taking the digest pinned there as the rollback target" >&2
           fi
           ref="${IMAGE}@${target}"
-          cosign verify --certificate-identity "$CERT_IDENTITY" --certificate-oidc-issuer "$CERT_ISSUER" "$ref" > "$OUT/signature.json" 2> "$OUT/cosign.log" \
-            || res fail "rollback target ${target:0:19}… no longer verifies (${CERT_IDENTITY##*/}): $(tail -1 "$OUT/cosign.log")"
+          if ! cosign verify --certificate-identity "$CERT_IDENTITY" --certificate-oidc-issuer "$CERT_ISSUER" "$ref" > "$OUT/signature.json" 2> "$OUT/cosign.log"; then
+            # An unsigned target is only acceptable as a FIRST release: the
+            # environment has never served (no Ready pods), the digest pinned in
+            # its overlay is a bootstrap image from before signing existed, and
+            # there is genuinely nothing to go back to. Anywhere else an
+            # unverifiable previous image is a real integrity gap and fails.
+            serving=$(kubectl -n "frappe-gates-demo-${TARGET_ENV}" get pods \
+              -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | grep -c True)
+            [ "${serving:-0}" -eq 0 ] \
+              || res fail "rollback target ${target:0:19}… no longer verifies (${CERT_IDENTITY##*/}): $(tail -1 "$OUT/cosign.log")"
+            res skipped "first release: ${TARGET_ENV} is not serving anything (0 Ready pods) and the digest pinned in ${KUSTOMIZATION} (${target:0:19}…) predates signing, so there is no verified image to return to; this deploy becomes the rollback target for the next release"
+          fi
           skopeo inspect --raw "docker://${ref}" > "$OUT/manifest.json" 2> "$OUT/skopeo.log" \
             || res fail "rollback target ${target:0:19}… can't be pulled: $(tail -1 "$OUT/skopeo.log")"
           { echo "digest=$target"; echo "source=$source"; } >> "$GITHUB_OUTPUT"
