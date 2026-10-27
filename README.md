@@ -97,6 +97,34 @@ runs:
   mapping lives in `.github/scripts/gate.py`, one list, so a criterion cannot
   silently disappear.
 
+### What the post-deploy tests need from the host
+
+`tests/env/env-up.sh` runs on a self-hosted runner and reaches the deployed pod
+through `kubectl` — it lists the pods, forwards a port to the rollout's pod and
+puts Caddy with a throwaway CA in front of it. Three things about that are easy
+to get wrong, and each of them once failed a release that had deployed fine:
+
+* **The kubeconfig must not expire.** `tests/env/env-runner.sh` reads a durable
+  `service-account-token` Secret. A `kubectl create token --duration=2h`
+  TokenRequest looks equivalent and expires mid-flight, after which every job
+  fails with `error: You must be logged in to the server (Unauthorized)` — which
+  reads like a permissions bug, not a stale credential.
+* **The runner's ServiceAccount needs the namespace.** Only `get`/`list` pods
+  and `create` on `pods/portforward` and `pods/exec` (`deploy/base/rbac.yaml`).
+  Runners are shared between product repos and each repo's installer mints its
+  own token, so both `frappe-gates-demo-tools/env-tester` and
+  `django-gates-demo-tools/env-tester` are bound: otherwise a job on the other
+  repo's runner fails with `pods is forbidden ... cannot list resource "pods"`.
+* **The load test measures the harness, not the app.** k6 reaches the pod over
+  `kubectl port-forward`, so its p95 follows host load (740 ms — 2260 ms across
+  runs) no matter how the app behaves. It holds no failed requests and all
+  checks green, with a 3000 ms harness budget; the 500 ms SLO belongs to the
+  in-cluster probes.
+
+`security/accepted-risks.json` carries the TLS findings that come from that
+throwaway CA (`cert_revocation`, the intermediate's expiry): they are properties
+of the harness, they expire, and the verdict prints every accepted id.
+
 ### Deviations from `django-gates-demo` (declared, not accidental)
 
 | Area | django-gates-demo | here | why |
