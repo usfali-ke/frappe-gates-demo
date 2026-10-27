@@ -101,37 +101,41 @@ jobs:
               "docker-archive:/data/${tag}.tar" \
               -q -o cyclonedx-json="/data/${tag}.cdx.json"
             rm -f "$RUNNER_TEMP/mirror/${tag}.tar"
-            # Written by python, not a heredoc: the previous attempt produced a
-            # statement cosign rejected with "required field buildDefinition
-            # missing", which is what a shell-expanded, indented heredoc looks
-            # like once it is half-parsed.
+            # Predicate ONLY, no _type/subject wrapper: `cosign attest --type
+            # slsaprovenance1` treats the file as the predicate and builds the
+            # statement around it, which is how .github/scripts/slsa_predicate.py
+            # works for the app image. My earlier full in-toto statement made
+            # cosign answer "required field buildDefinition missing".
             python3 - "$ref" "$digest" "$RUNNER_TEMP/mirror/${tag}.slsa.json" <<'PY'
           import json, os, sys
 
-          ref, digest, path = sys.argv[1], sys.argv[2].split(":", 1)[1], sys.argv[3]
-          run = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-          statement = {
-              "_type": "https://in-toto.io/Statement/v1",
-              "subject": [{"name": ref, "digest": {"sha256": digest}}],
-              "predicateType": "https://slsa.dev/provenance/v1",
-              "predicate": {
-                  "buildDefinition": {
-                      "buildType": "https://actions.github.io/buildtypes/workflow/v1",
-                      "externalParameters": {
-                          "workflow": {"ref": "refs/heads/main", "path": ".github/workflows/mirror-deps.yaml"},
-                          "source": "docker.io (digest-pinned upstream copy)",
+          ref, digest, path = sys.argv[1], sys.argv[2], sys.argv[3]
+          e = os.environ
+          repo_url = f"{e['GITHUB_SERVER_URL']}/{e['GITHUB_REPOSITORY']}"
+          predicate = {
+              "buildDefinition": {
+                  "buildType": "https://actions.github.io/buildtypes/workflow/v1",
+                  "externalParameters": {
+                      "workflow": {
+                          "ref": e["GITHUB_REF"],
+                          "repository": repo_url,
+                          "path": ".github/workflows/mirror-deps.yaml",
                       },
-                      "internalParameters": {"repository": os.environ["GITHUB_REPOSITORY"]},
-                      "resolvedDependencies": [{"uri": f"pkg:docker/{ref}"}],
+                      "mirroredImage": ref,
                   },
-                  "runDetails": {
-                      "builder": {"id": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"},
-                      "metadata": {"invocationId": run},
-                  },
+                  "internalParameters": {"github": {"event_name": e["GITHUB_EVENT_NAME"], "runner_environment": "github-hosted"}},
+                  "resolvedDependencies": [
+                      {"uri": f"pkg:docker/{ref}@sha256:{digest.split(':', 1)[1]}"},
+                      {"uri": f"git+{repo_url}@{e['GITHUB_REF']}", "digest": {"gitCommit": e["GITHUB_SHA"]}},
+                  ],
+              },
+              "runDetails": {
+                  "builder": {"id": f"https://github.com/{e['GITHUB_REPOSITORY']}/actions/runs/{e['GITHUB_RUN_ID']}"},
+                  "metadata": {"invocationId": f"{repo_url}/actions/runs/{e['GITHUB_RUN_ID']}"},
               },
           }
           with open(path, "w") as fh:
-              json.dump(statement, fh, indent=2)
+              json.dump(predicate, fh, indent=2)
           PY
           done
 
