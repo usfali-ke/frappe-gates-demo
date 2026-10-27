@@ -745,8 +745,12 @@ jobs:
             # its overlay is a bootstrap image from before signing existed, and
             # there is genuinely nothing to go back to. Anywhere else an
             # unverifiable previous image is a real integrity gap and fails.
+            # `bash -e` (GitHub's default shell) aborts on a failed assignment,
+            # and grep -c exits 1 when it counts zero matches — which is exactly
+            # the case this branch is looking for. Swallow that exit status.
             serving=$(kubectl -n "frappe-gates-demo-${TARGET_ENV}" get pods \
-              -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | grep -c True)
+              -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null \
+              | grep -c True || true)
             [ "${serving:-0}" -eq 0 ] \
               || res fail "rollback target ${target:0:19}… no longer verifies (${CERT_IDENTITY##*/}): $(tail -1 "$OUT/cosign.log")"
             res skipped "first release: ${TARGET_ENV} is not serving anything (0 Ready pods) and the digest pinned in ${KUSTOMIZATION} (${target:0:19}…) predates signing, so there is no verified image to return to; this deploy becomes the rollback target for the next release"
