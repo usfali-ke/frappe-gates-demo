@@ -466,7 +466,9 @@ jobs:
           uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py < "$OUT/${TARGET_ENV}.yaml" > "$OUT/checkov/scan-view.yaml"
           docker run --rm -v "$PWD/$OUT/checkov:/work" "$CHECKOV" -f /work/scan-view.yaml --framework kubernetes \
             -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
-          changed=$(git status --porcelain | awk '{print $2}' | grep -v '^reports/' | tr '\n' ' ')
+          # `bash -e` aborts on a failed assignment; grep exits 1 when nothing
+          # changed, which is the case this line exists to detect.
+          changed=$(git status --porcelain | awk '{print $2}' | grep -v '^reports/' | tr '\n' ' ' || true)
           echo "changed=${changed}" >> "$GITHUB_OUTPUT"
           # Empty means deploy/${TARGET_ENV} already pins this digest — a
           # re-promotion or a retry, where the correct action is to change
