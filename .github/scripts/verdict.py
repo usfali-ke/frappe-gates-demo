@@ -556,8 +556,18 @@ def kubeconform(path):
     total = sum(summary.get(k, 0) for k in ("valid", "invalid", "errors", "skipped"))
     changed = (env("CHANGED") or "").split()
     kustomization = env("KUSTOMIZATION", "deploy/prod/kustomization.yaml")
-    ok = env("RC") == "0" and total > 0 and valid == total and changed == [kustomization]
-    return ok, f"{os.path.dirname(kustomization)} render: {valid}/{total} resources valid (kubeconform -strict); change vs git: {', '.join(changed) or 'none'} (image digest only)", None
+    # No change vs git is the correct outcome when the environment already runs
+    # this digest (the release was re-dispatched for it, or a retry landed on the
+    # same image): the render must still have referenced the digest, which the
+    # workflow asserts before calling this, and any other drift would show up as
+    # a changed path and fail here.
+    already_pinned = env("ALREADY_PINNED") == "1"
+    ok = env("RC") == "0" and total > 0 and valid == total and (changed == [kustomization] or (already_pinned and not changed))
+    if already_pinned and not changed:
+        detail = f"{os.path.dirname(kustomization)} render: {valid}/{total} resources valid (kubeconform -strict); change vs git: none — already pinned to the promoted digest, nothing to commit"
+    else:
+        detail = f"{os.path.dirname(kustomization)} render: {valid}/{total} resources valid (kubeconform -strict); change vs git: {', '.join(changed) or 'none'} (image digest only)"
+    return ok, detail, None
 
 
 # --- code quality -----------------------------------------------------------

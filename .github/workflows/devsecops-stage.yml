@@ -466,12 +466,19 @@ jobs:
           uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py < "$OUT/${TARGET_ENV}.yaml" > "$OUT/checkov/scan-view.yaml"
           docker run --rm -v "$PWD/$OUT/checkov:/work" "$CHECKOV" -f /work/scan-view.yaml --framework kubernetes \
             -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
-          echo "changed=$(git status --porcelain | awk '{print $2}' | grep -v '^reports/' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+          changed=$(git status --porcelain | awk '{print $2}' | grep -v '^reports/' | tr '\n' ' ')
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          # Empty means deploy/${TARGET_ENV} already pins this digest — a
+          # re-promotion or a retry, where the correct action is to change
+          # nothing. The render above still had to reference the digest, so the
+          # verdict can accept "no change" as long as nothing else drifted.
+          [ -n "$changed" ] || echo "already_pinned=1" >> "$GITHUB_OUTPUT"
       - id: verdict
         if: always()
         env:
           RC: ${{ steps.check.outputs.rc }}
           CHANGED: ${{ steps.check.outputs.changed }}
+          ALREADY_PINNED: ${{ steps.check.outputs.already_pinned }}
           TOOL: kubeconform 0.8.0 + checkov 3.3.20
         run: |
           rc=0
