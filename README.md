@@ -184,3 +184,5 @@ Operational notes that cost real time here, worth keeping:
 <!-- AI review e2e check: 2026-10-26T11:59:34Z -->
 
 <!-- pipeline exercise 2026-10-26: AI review now ships the PR diff and retries a NOT COMPLETED answer -->
+
+<!-- release ladder exercise 2026-10-27T06:49Z: site DB name + orphan drop -->
