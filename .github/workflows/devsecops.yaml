@@ -670,18 +670,32 @@ jobs:
   image-scan:
     name: Build · image scan (trivy)
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    # Release: scan the pushed release image (the identity the build
+    # recorded). PR: build the image locally first (no push, no tag - a PR
+    # still has no registry or tag side effects) and scan that, so the
+    # image-scan control and its dojo report run on PR runs too.
     needs: [version, build]
-    timeout-minutes: 60
+    # The PR branch overrides the needs gate (version + build are skipped on
+    # PR runs); on release the job still requires them to have succeeded.
+    if: >-
+      github.event_name == 'pull_request' ||
+      success()
+    timeout-minutes: 120
     permissions:
-      packages: read
+      packages: read   # GHCR pull: the private bench base (PR) / the built image (release)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ secrets.GIT_TOKEN }}
           fetch-depth: 1
 
-      - name: Login to GHCR (pull the built image)
+      - name: "Setup buildx (PR mode: local image build)"
+        if: github.event_name == 'pull_request'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker   # --load into the local daemon (single-platform amd64)
+
+      - name: Login to GHCR (pull the private bench base on PR / the built image on release)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -701,15 +715,27 @@ jobs:
           mkdir -p /tmp/trivy-bin
           tar xzf /tmp/trivy.tgz -C /tmp/trivy-bin trivy
 
-      - name: Pull the built image and scan it (HIGH/CRITICAL, SARIF)
+      - name: Build the image locally (PR mode - no push, no tag, no registry side effects)
+        if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
-          TAG="${{ needs.version.outputs.semVer }}"
-          docker pull "${GHCR_REGISTRY}/${IMAGE_NAME}:${TAG}"
+          # The merge ref (the PR code merged into the base - what the other
+          # Develop controls test), tagged only in the local daemon.
+          docker buildx build --platform linux/amd64 \
+            -t "${GHCR_REGISTRY}/${IMAGE_NAME}:pr-${GITHUB_RUN_ID}" --load .
+
+      - name: Pull and scan the image (HIGH/CRITICAL, SARIF)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            REF="${GHCR_REGISTRY}/${IMAGE_NAME}:pr-${GITHUB_RUN_ID}"
+          else
+            REF="${GHCR_REGISTRY}/${IMAGE_NAME}:${{ needs.version.outputs.semVer }}"
+            docker pull "$REF"
+          fi
           mkdir -p image-scan
           /tmp/trivy-bin/trivy image --severity HIGH,CRITICAL \
-            --format sarif --output image-scan/trivy.sarif \
-            "${GHCR_REGISTRY}/${IMAGE_NAME}:${TAG}"
+            --format sarif --output image-scan/trivy.sarif "$REF"
           [ -s image-scan/trivy.sarif ] || { echo "trivy produced no SARIF report (fail-closed)"; exit 1; }
 
       # Evidence: the control's report as an artifact (the reference shape).
@@ -1033,17 +1059,18 @@ jobs:
   #    release-engine fallback for setup writes - the dojo-import lib
   #    resolves the product/engagement by name). Runs on PR runs too: the
   #    Develop-phase reports are imported per PR run (the dojo model this
-  #    repo's own defectdojo-upload workflow used); on a PR the image-scan
-  #    report is absent and dojo-import skips it per-file. DefDojo is a
+  #    repo's own defectdojo-upload workflow used); the image scan runs on
+  #    PR as well (the image is built locally and scanned - no registry side
+  #    effects), so its report lands in dojo on both paths; a missing report
+  #    (a crashed control) is skipped per-file by dojo-import. DefDojo is a
   #    reporting sink, not a release control - it is NOT in the gate needs,
   #    by design.
   defdojo:
     name: DefDojo · import all control reports (frappe-gates-demo)
     runs-on: ubuntu-latest
-    # image-scan is deliberately NOT in the needs: it is release-only (no
-    # image is built on PR runs), and its import is skip-missing like the
-    # rest of the report downloads.
-    needs: [sast, secrets, secrets-th, quality, iac, sca]
+    # image-scan is in the needs on both paths (it runs on release and on
+    # PR) so defdojo waits for it - no artifact race.
+    needs: [sast, secrets, secrets-th, quality, iac, sca, image-scan]
     timeout-minutes: 15
     env:
       LIB: /tmp/devsecops-lib
@@ -1164,9 +1191,12 @@ jobs:
     name: PR · findings comment (baseline-diffed feedback)
     runs-on: ubuntu-latest
     # PR runs only; always() so the comment still posts (with failures
-    # marked) when a needed control did not succeed.
+    # marked) when a needed control did not succeed. It waits for
+    # image-scan (the PR image build + scan) and ai-security (the hermes PR
+    # review - up to WAIT_SECONDS) so their rows render; the hermes result
+    # is advisory (NOT a gate input), the image-scan result is a gate input.
     if: always() && github.event_name == 'pull_request'
-    needs: [sast, secrets, secrets-th, quality, iac, sca, unit-tests]
+    needs: [sast, secrets, secrets-th, quality, iac, sca, image-scan, unit-tests, ai-security]
     timeout-minutes: 15
     permissions:
       contents: read

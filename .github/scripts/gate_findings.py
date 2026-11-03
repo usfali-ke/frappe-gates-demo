@@ -137,16 +137,37 @@ def _sarif_levels(path):
     return out
 
 
+def _sarif_trivy_sev(r):
+    """Severity of one trivy SARIF result. Trivy maps both Critical and High
+    to the SARIF level "error"; the band is recovered from the level (some
+    trivy versions emit the severity name itself) or from the
+    properties.security-severity score (9.5 critical / 8.0 high). The scans
+    run --severity HIGH,CRITICAL, so an "error" result without a score is
+    banded HIGH (the lower of the two, never hiding a critical)."""
+    lvl = (r.get("level") or "").upper()
+    if lvl == "CRITICAL":
+        return "CRITICAL"
+    if lvl == "HIGH":
+        return "HIGH"
+    if lvl == "ERROR":
+        try:
+            score = float((r.get("properties") or {}).get("security-severity") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        return "CRITICAL" if score >= 9.0 else "HIGH"
+    if lvl == "WARNING":
+        return "MEDIUM"
+    return "LOW"
+
+
 def grade_trivy(path):
-    """trivy SARIF: results[].level (the scans run --severity HIGH,CRITICAL)."""
-    levels = _sarif_levels(path)
-    return {
-        "CRITICAL": levels.count("CRITICAL"),
-        "HIGH": levels.count("HIGH"),
-        "MEDIUM": levels.count("MEDIUM"),
-        "LOW": len(levels) - levels.count("CRITICAL") - levels.count("HIGH")
-        - levels.count("MEDIUM"),
-    }
+    """trivy SARIF: per-result severity via _sarif_trivy_sev."""
+    d = _load_json(path)
+    c = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for run in d.get("runs", []):
+        for r in run.get("results", []):
+            c[_sarif_trivy_sev(r)] += 1
+    return c
 
 
 def grade_checkov(path):
@@ -274,7 +295,7 @@ def list_findings(path, tool, detail_limit=120):
                 if tool == "checkov":
                     band = {"ERROR": "HIGH", "WARNING": "MEDIUM"}.get(lvl, "LOW")
                 else:
-                    band = lvl if lvl in ("CRITICAL", "HIGH") else (lvl or "LOW")
+                    band = _sarif_trivy_sev(r)
                 phys = (((r.get("locations") or [{}])[0]).get("physicalLocation") or {})
                 art = phys.get("artifactLocation") or {}
                 region = phys.get("region") or {}
