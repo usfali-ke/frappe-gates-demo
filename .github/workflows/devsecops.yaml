@@ -444,7 +444,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          WAIT_SECONDS: "1500"
+          WAIT_SECONDS: "1800"
+          # The gateway reviewer is flaky (it fast-fails with a NOT COMPLETED
+          # placeholder instead of completing the review most of the time), so
+          # ask more than once before giving up: 5 attempts within the 30-min
+          # budget instead of the default 3 (the one completed review took ~5m,
+          # so each attempt gets a 6-min window).
+          REVIEW_ATTEMPTS: "5"
         run: |
           set -euo pipefail
           mkdir -p "$OUT"
