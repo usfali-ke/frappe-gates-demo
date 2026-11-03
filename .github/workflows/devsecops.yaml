@@ -46,12 +46,6 @@ name: devsecops pipeline
 #   - the release job triggers the Kargo warehouse refresh when
 #     KARGO_WEBHOOK_URL is set (this app has no Kargo wiring yet - the step
 #     is a no-op without the secret).
-#   - the Hermes AI security review (RELEASE mode - the shared lib's
-#     hermes-review, the same job hmis's build-deploy.yaml carries): present
-#     but `if: false` in the same state as hmis (2026-10-28) - the
-#     hermes.usfali.com service does not implement the release_review handler
-#     yet, and a failed hermes job would block G2 on every run. Re-enable per
-#     the hermes job comment; while disabled it is NOT in the G2 needs.
 #
 # Phases + controls: Develop (source, in parallel with the build): SAST
 # (semgrep) - secrets (gitleaks, full history) - secrets (trufflehog,
@@ -387,105 +381,6 @@ jobs:
           path: quality/
           if-no-files-found: ignore
 
-  # ── Hermes AI security review (RELEASE mode): the same job hmis's
-  #    build-deploy.yaml carries (the shared lib's hermes-review - reviews
-  #    the release-branch commit, the <last release tag>..HEAD diff, the
-  #    verdict as a commit comment). SKIPPED for now, like hmis's
-  #    (2026-10-28): the hermes.usfali.com service does not implement the
-  #    release_review handler yet (it answers
-  #    {"status":"ignored", "event":"release_review"} -> the 1500s verdict
-  #    poll times out -> the job fails and blocks G2 on every run). Re-enable
-  #    when the service is ready: restore
-  #    `if: github.event_name != 'pull_request'` and add hermes back to the
-  #    gate-g2 needs list.
-  hermes:
-    name: Develop · AI security review (Hermes, release commit)
-    runs-on: [self-hosted, linux, x64]
-    if: false
-    timeout-minutes: 40
-    permissions:
-      contents: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      LIB: /tmp/devsecops-lib
-      OUT: reports/ai-review
-      VERDICT_FILE: reports/ai-review/verdict.json
-      # How long to wait for the verdict commit comment (the dev-flow PR
-      # review uses the same 25 minutes)
-      WAIT_SECONDS: "1500"
-      # A release diff larger than this fails closed instead of sending a
-      # truncated diff and claiming the whole release was reviewed.
-      # 5 MB: the diff is <last release tag>..HEAD and it ACCUMULATES release
-      # cycles between tags (the tag only moves when a release completes and
-      # the handoff pushes it). The ceiling stays a truncation guard; after
-      # the first tagged release the diff resets to a single cycle and sits
-      # far below it.
-      MAX_DIFF_BYTES: "5242880"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          token: ${{ secrets.GIT_TOKEN }}
-          # Full history + tags: the review diff is <last release
-          # tag>..branch-tip (the script needs the tag graph + the diff
-          # blobs)
-          fetch-depth: 0
-
-      - name: Checkout shared library (devsecops-release-lib)
-        env:
-          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
-          LIB_REF: ${{ inputs.lib_ref || 'main' }}
-        run: |
-          set -euo pipefail
-          rm -rf "$LIB"
-          git clone --depth 1 --branch "$LIB_REF" \
-            "https://x-access-token:${GIT_TOKEN}@github.com/tiberbu/devsecops-release-lib.git" "$LIB"
-          test -f "$LIB/resources/devsecops-gh.sh" || {
-            echo "::error::devsecops-gh.sh not found at lib ref '$LIB_REF' - the shared library must be deployed; dispatch with lib_ref=<branch> or merge the lib PR first"
-            exit 1; }
-
-      - name: Resolve review subject (release branch + its tip - NOT the run sha)
-        id: subject
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          TARGET_BRANCH: ${{ inputs.target_branch }}
-        run: |
-          set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            B="$TARGET_BRANCH"
-          elif [[ "$EVENT_NAME" == "push" ]]; then
-            B="${GITHUB_REF#refs/heads/}"
-          else
-            # repository_dispatch trigger_release = release the main branch
-            # (the dispatch runs on the default branch - be explicit).
-            B="main"
-          fi
-          git show-ref --verify --quiet "refs/remotes/origin/$B" || {
-            echo "::error::release branch '$B' not found in the checkout (fetch-depth: 0 must include all branches)"
-            exit 1; }
-          S=$(git rev-parse "refs/remotes/origin/$B^{commit}")
-          echo "branch=$B" >> "$GITHUB_OUTPUT"
-          echo "sha=$S" >> "$GITHUB_OUTPUT"
-          echo "Review subject: $B @ $S"
-
-      - name: Hermes AI security review (shared lib, release mode - the tag..HEAD diff of the release commit)
-        id: verdict
-        env:
-          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
-          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
-          HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          BRANCH: ${{ steps.subject.outputs.branch }}
-          HEAD_SHA: ${{ steps.subject.outputs.sha }}
-        run: bash "$LIB/resources/devsecops-gh.sh" hermes-review
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: report-ai-review
-          path: reports/ai-review/
-          if-no-files-found: ignore
 
   # ── IaC: checkov on the repo's own Dockerfile (the Dockerfile is in the
   #    checkout, so this control runs on PR runs too, and the report is a
@@ -857,9 +752,6 @@ jobs:
     # cosign IS in the needs (the signed image is a release control - a
     # failing signature blocks the tag). unit-tests IS in the needs (the
     # bench suite is a gate control in this app - enabled, green on main).
-    # hermes is NOT in the needs (skipped for now - the service does not
-    # implement the release_review handler yet; re-enable it per the hermes
-    # job comment and add it to the needs at the same time).
     needs: [version, build, cosign, image-scan, sast, secrets, secrets-th, quality, iac, sca, unit-tests, dockle, sbom]
     timeout-minutes: 5
     steps:
