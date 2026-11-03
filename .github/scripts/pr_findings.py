@@ -77,9 +77,11 @@ REPORTS_DIR = os.path.join(os.getcwd(), "reports")
 
 # Report files the PR findings gate requires (flat artifact layout - the
 # merge-multiple download places the zip-root files directly in ./reports).
-# This app runs the IaC + image-scan + unit-test controls on PR runs too
-# (the Dockerfile, the built image and the bench suite are in the
-# checkout), so checkov.sarif + trivy.sarif + junit.xml are required here.
+# This app runs the IaC + unit-test controls on PR runs too (the Dockerfile
+# and the bench suite are in the checkout), so checkov.sarif + junit.xml are
+# required here. The image-scan report (trivy.sarif) is NOT required: the
+# image scan is release-only (no image is built on a PR), so the file is
+# simply absent on PR runs and the image-scan row is not rendered.
 # NOTE: "thufflehog.json" (not trufflehog.json) is the real report name -
 # the workflow's trufflehog-scan call writes that file.
 PR_REQUIRED_REPORTS = [
@@ -89,7 +91,6 @@ PR_REQUIRED_REPORTS = [
     "ruff.json",
     "checkov.sarif",
     "trivy-fs.sarif",
-    "trivy.sarif",
     "junit.xml",
 ]
 
@@ -332,10 +333,12 @@ def baseline_data(baseline_run):
 
 
 # The develop controls the PR's gate verdict is evaluated over (this job's
-# needs - the controls that run on a PR: the source controls + the image
-# scan + the bench unit-test suite). The AI review is deliberately NOT here:
-# like hmis's ai_security it is an advisory control, not a gate input.
-GATE_CONTROLS = ["sast", "secrets", "secrets-th", "quality", "iac", "sca", "image-scan", "unit-tests"]
+# needs - the controls that run on a PR: the source controls + the bench
+# unit-test suite). The image scan is release-only (no image is built on a
+# PR), so it is not a gate input here. The AI review is deliberately NOT
+# here either: like hmis's ai_security it is an advisory control, not a
+# gate input.
+GATE_CONTROLS = ["sast", "secrets", "secrets-th", "quality", "iac", "sca", "unit-tests"]
 
 
 def _needs_map():
@@ -448,6 +451,12 @@ def render(pr_run, baseline, bdata):
     # this run's counts (artifacts merged flat into ./reports/)
     for label, art, _rel, _counter, unit in CONTROLS:
         val, display = count_in_dir(REPORTS_DIR, (label, art, _rel, _counter, unit))
+        # the image-scan control is release-only (no image is built on a PR
+        # run): a missing report is the expected state, so its row is
+        # simply not rendered (unlike a missing REQUIRED control report,
+        # which is a red flag that must be shown)
+        if val is None and art == "report-image-scan":
+            continue
         chn = blocking_count(_rel)
         base = bdata.get(art) if bdata else None
         if base is None or unit == "tests":
@@ -468,8 +477,13 @@ def render(pr_run, baseline, bdata):
         lines.append(f"| {icon} | {AI_REVIEW_LABEL} | {chn} | {newcol} | {_md_cell(ai_verdict.get('detail') or '', 140)} |")
     else:
         res = (needs.get("ai-security") or {}).get("result") if needs else None
-        icon = {"success": "✅", "skipped": "⏭️"}.get(res or "", "⏭️" if res in (None, "skipped") else "❌")
-        lines.append(f"| {icon} | {AI_REVIEW_LABEL} | – | – | no report (job skipped or failed before the verdict) |")
+        if res in (None, "skipped"):
+            icon, why = "⏭️", "job skipped (or its result is not visible)"
+        elif res == "success":
+            icon, why = "⚠️", "job succeeded but no report landed"
+        else:
+            icon, why = "❌", "job failed before the verdict"
+        lines.append(f"| {icon} | {AI_REVIEW_LABEL} | – | – | no report ({why}) |")
 
     # the new-vs-main C/H section (the reference format's "new blocking"
     # section; the C/H band is this app's reported band). Like the
