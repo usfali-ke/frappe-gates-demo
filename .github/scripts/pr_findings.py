@@ -45,6 +45,20 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_findings  # noqa: E402
 
+
+def _opener() -> urllib.request.OpenerDirector:
+    # ONLY the HTTP(S) handlers (urlopen would also install file://, ftp://
+    # and data: handlers - a dynamic URL must not be able to read local
+    # files). The same pattern as hermes_review.py / defectdojo_upload.py.
+    opener = urllib.request.OpenerDirector()
+    for h in (urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(), urllib.request.HTTPDefaultErrorHandler(),
+              urllib.request.HTTPErrorProcessor(), urllib.request.HTTPRedirectHandler(), urllib.request.UnknownHandler()):
+        opener.add_handler(h)
+    return opener
+
+
+_HTTP = _opener()
+
 API = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
@@ -86,7 +100,7 @@ def api(method, path, data=None):
     if body is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with _HTTP.open(req, timeout=60) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as e:
@@ -199,7 +213,7 @@ def count_in_artifact_zip(zip_path, control):
 
 def download_artifact(archive_url, dest):
     req = urllib.request.Request(archive_url, headers={"User-Agent": "devsecops-findings"})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as fh:
+    with _HTTP.open(req, timeout=120) as resp, open(dest, "wb") as fh:
         fh.write(resp.read())
 
 
