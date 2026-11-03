@@ -93,7 +93,7 @@ def finish(status: str, detail: str, **metrics) -> NoReturn:
     sys.exit(0 if status == "pass" else 1)  # a verdict is final
 
 
-DIFF_CAP = 60000  # characters; the prompt renders this into one message
+DIFF_CAP = 450000  # characters; same cap as the working PR/release clients
 
 
 def review_context(event: dict) -> dict:
@@ -138,13 +138,21 @@ def review_context(event: dict) -> dict:
     files = sorted({line.split(" b/", 1)[-1] for line in diff.splitlines() if line.startswith("diff --git ")})
     if len(diff) > DIFF_CAP:
         diff = diff[:DIFF_CAP] + f"\n\n[diff truncated at {DIFF_CAP} characters; {len(files)} files changed]\n"
+    # Same key names, value types and status words as the working PR-mode
+    # (hmis) and release-mode clients: the gateway only substitutes the keys
+    # it finds in the delivery payload, so a missing key (e.g. diff_sha256)
+    # leaves a literal {hermes_context.*} placeholder in the reviewer's
+    # prompt and the reviewer answers "Security review: NOT COMPLETED"
+    # instead of reviewing.
+    raw = diff.encode("utf-8")
     ctx = {
-        "source": "pipeline (gh pr diff at the head commit)",
-        "diff_status": "ok" if diff else "unavailable",
-        "reason": reason or "n/a",
-        "file_count": str(len(files)),
-        "diff_bytes": str(len(diff.encode())),
-        "changed_files": ", ".join(files)[:2000] or "none",
+        "source": "github-actions-authenticated",
+        "diff_status": "available" if diff.strip() else "unavailable",
+        "reason": reason or "",
+        "changed_files": "\n".join(files) or "none",
+        "file_count": len(files),
+        "diff_bytes": len(raw),
+        "diff_sha256": hashlib.sha256(raw).hexdigest(),
         "pr_diff": diff or "(the pipeline could not fetch the diff: " + (reason or "unknown") + ")",
     }
     print(f"context: {ctx['diff_status']} {ctx['diff_bytes']}b {ctx['file_count']} file(s)"
