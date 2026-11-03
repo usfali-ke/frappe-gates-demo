@@ -11,7 +11,8 @@ baseline note and the run link), diffs the CRITICAL/HIGH band against the
 baseline (the latest SUCCESSFUL release run on the base branch, fetched
 via the GitHub API), and posts/updates one marker-anchored comment on the
 PR. The same rendered body is delivered as the run's Summary (the run
-page), where the full all-severity list follows.
+page), where the C/H findings list (CRITICAL/HIGH only - Low/Medium
+stays in the downloadable report artifacts) follows.
 
 Gate: REPORT-ONLY for CRITICAL/HIGH findings (the hmis policy 2026-10-28,
 the facility360 policy 2026-10-29, adopted by this app - the app does not
@@ -630,15 +631,20 @@ def main():
 
     # the run's Summary gets the SAME rendered body (the reference format -
     # the run page delivers the summary like the reference run), and under
-    # it the full all-severity list (the PR comment carries C/H only).
+    # it the C/H findings only (Low/Medium stays in the report artifacts).
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
     if summary_path:
         all_items = findings_items()
+        ch_items = [(l, it) for l, it in all_items if it[0] in ("CRITICAL", "HIGH")]
         with open(summary_path, "a") as fh:
             fh.write(body)
-            fh.write("\n\n## All findings (this run — full list, all severities, CRITICAL first)\n\n")
-            fh.write(_all_findings_md(all_items))
-            fh.write("\n_The PR comment lists C/H only (new vs main); the full list is here._\n")
+            if ch_items:
+                fh.write("\n\n## C/H findings (this run — CRITICAL/HIGH only; "
+                         "Low/Medium: download the report-* artifacts)\n\n")
+                fh.write(_all_findings_md(ch_items))
+            else:
+                fh.write("\n\n_No CRITICAL/HIGH findings in this run's reports "
+                         "(Low/Medium: download the report-* artifacts)._\n")
 
     # ── PR findings gate (REPORT-ONLY for CRITICAL/HIGH): findings are
     #    graded + listed but never fail the check; the run FAILS when a
