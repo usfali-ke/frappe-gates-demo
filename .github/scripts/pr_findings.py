@@ -393,6 +393,13 @@ def blocking_count(rel):
 # stay listed, only the detail text shortens)
 DETAIL_LIMIT = 120
 
+# severity ordering for the per-finding tables (blocking first, by severity)
+_SEV_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+
+def _sev_rank(sev):
+    return _SEV_RANK.get((sev or "").upper(), 4)
+
 
 def findings_items():
     """Every individual finding in this run's PR reports (flat layout), as
@@ -558,11 +565,28 @@ def render(pr_run, baseline, bdata):
 
 
 def _ch_table(lines, items):
+    # CRITICAL first, then HIGH - blocking findings on top
+    ordered = sorted(items, key=lambda p: (_sev_rank(p[1][0]), p[0]))
     lines += ["| Control | Severity | Finding | Where | Detail |", "|---|---|---|---|---|"]
-    for label, (sev, _tool, rule, loc, detail) in items[:30]:
+    for label, (sev, _tool, rule, loc, detail) in ordered[:30]:
         lines.append(f"| {_md_cell(label, 40)} | {sev} | `{_md_cell(rule, 60)}` | `{_md_cell(loc, 80)}` | {_md_cell(detail, DETAIL_LIMIT)} |")
-    if len(items) > 30:
-        lines.append(f"\n…and {len(items) - 30} more: see the job summaries.")
+    if len(ordered) > 30:
+        lines.append(f"\n…and {len(ordered) - 30} more: see the job summaries.")
+
+
+def _all_findings_md(items):
+    """The run-Summary full list: every finding, all severities, sorted
+    CRITICAL -> HIGH -> MEDIUM -> LOW (then by control, then location) with
+    the control it belongs to - the readable 'blocking first' shape."""
+    if not items:
+        return "_no findings in this run's reports_\n"
+    ordered = sorted(items, key=lambda p: (_sev_rank(p[1][0]), p[0], p[1][3]))
+    lines = ["| Control | Severity | Rule | Location | Detail |", "|---|---|---|---|---|"]
+    for label, (sev, _tool, rule, loc, detail) in ordered:
+        lines.append("| %s | %s | `%s` | `%s` | %s |" % (
+            _md_cell(label, 40), sev or "—", _md_cell(rule, 60),
+            _md_cell(loc, 80), _md_cell(detail, DETAIL_LIMIT)))
+    return "\n".join(lines) + "\n"
 
 
 baseline_counts_global = {}
@@ -612,8 +636,8 @@ def main():
         all_items = findings_items()
         with open(summary_path, "a") as fh:
             fh.write(body)
-            fh.write("\n\n## All findings (this run — full list, all severities)\n\n")
-            fh.write(gate_findings.render_findings_md([it for _l, it in all_items]))
+            fh.write("\n\n## All findings (this run — full list, all severities, CRITICAL first)\n\n")
+            fh.write(_all_findings_md(all_items))
             fh.write("\n_The PR comment lists C/H only (new vs main); the full list is here._\n")
 
     # ── PR findings gate (REPORT-ONLY for CRITICAL/HIGH): findings are

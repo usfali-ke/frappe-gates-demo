@@ -333,11 +333,16 @@ def list_findings(path, tool, detail_limit=120):
 
 
 def render_findings_md(items, detail_limit=120):
-    """ALL individual findings as one markdown table (the summary/PR body)."""
+    """ALL individual findings as one markdown table (the summary/PR body).
+    Sorted CRITICAL -> HIGH -> MEDIUM -> LOW (blocking first, by severity -
+    the reference job-summary shape), then tool/rule/location."""
     if not items:
         return "_no findings in the graded reports_\n"
+    rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    ordered = sorted(items, key=lambda it: (
+        rank.get((it[0] or "").upper(), 4), it[1], it[2], it[3]))
     lines = ["| Severity | Tool | Rule | Location | Detail |", "|---|---|---|---|---|"]
-    for sev, tool, rule, loc, detail in items:
+    for sev, tool, rule, loc, detail in ordered:
         lines.append("| %s | %s | %s | %s | %s |" % (sev or "—", tool, "`" + rule + "`", "`" + loc + "`", detail))
     return "\n".join(lines) + "\n"
 
