@@ -54,16 +54,21 @@
 name: devsecops-pipeline
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-  pull_request_review:
-    types: [submitted, dismissed]
-  push:
-    branches: [main]
-    # Deploy commits (devsecops-stage.yml) change only deploy/**. To
-    # release a deploy/-only or docs-only change, run this workflow on
-    # main by hand: it publishes like a push.
-    paths-ignore: ["deploy/**", "**.md"]
+  # TEMPORARILY DISABLED (2026-11-04): the ladder's auto triggers are
+  # commented out while the GHCR push fails ("The requested installation
+  # does not exist" - the app installation behind the registry login) and
+  # the Hermes wiring is being tested in devsecops.yaml. Re-enable by
+  # uncommenting; only manual dispatch runs in the meantime.
+  # pull_request:
+  #   types: [opened, synchronize, reopened, ready_for_review]
+  # pull_request_review:
+  #   types: [submitted, dismissed]
+  # push:
+  #   branches: [main]
+  #   # Deploy commits (devsecops-stage.yml) change only deploy/**. To
+  #   # release a deploy/-only or docs-only change, run this workflow on
+  #   # main by hand: it publishes like a push.
+  #   paths-ignore: ["deploy/**", "**.md"]
   workflow_dispatch:
 
 permissions: {}
