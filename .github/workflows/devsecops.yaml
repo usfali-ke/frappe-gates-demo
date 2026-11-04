@@ -381,20 +381,14 @@ jobs:
           path: quality/
           if-no-files-found: ignore
 
-  # ── Hermes AI security review (PULL mode): the repo-local hermes_review.py
-  #    (checked out at the trusted base SHA - the PR under review must not
-  #    be able to replace the review tooling). Asks the gateway for a
-  #    review of this PR (HMAC-signed event, delivery id gha-<run>-<attempt>),
-  #    polls for the PR comment ("Automated review by Hermes on commit <sha>",
-  #    posted by HERMES_COMMENTER after the ask) and fails on any
-  #    Critical/High finding; Medium/Low are advisory. The verdict is also
-  #    written as SARIF (the defectdojo-upload workflow imports it).
-  #    Standalone control: NOT in any gate's needs - like hmis's ai_security
-  #    it is its own check run + PR comment, it does not block G2.
-  #    The endpoint is the PR webhook (vars.HERMES_WEBHOOK_URL ->
-  #    hermes.usfali.com/webhooks/github-pr-review); if the gateway is down
-  #    or the verdict does not arrive within WAIT_SECONDS the job fails
-  #    (fail-closed, same bar as the other Develop controls).
+  # ── Hermes AI security review (hmis-style, single-delivery PULL mode):
+  #    the repo-local hermes_review.py (checked out at the trusted base SHA)
+  #    fetches the PR diff via `gh pr diff`, HMAC-signs the event payload,
+  #    sends ONE webhook to the gateway, then polls for the PR comment
+  #    ("Automated review by Hermes on commit <sha>", posted by
+  #    HERMES_COMMENTER). Findings are advisory — Critical/High do NOT
+  #    block; only a technical failure (NOT COMPLETED / timeout) fails the
+  #    job. Standalone control: NOT in any gate's needs.
   ai-security:
     name: Develop · AI security review (Hermes, PR)
     if: >-
@@ -416,8 +410,6 @@ jobs:
       - name: Checkout trusted review tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The base SHA: the review runs the tooling the repo has, not the
-          # code under review (a PR cannot rewrite hermes_review.py).
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
           fetch-depth: 1
@@ -430,6 +422,8 @@ jobs:
           set -euo pipefail
           [ -n "$HERMES_URL" ] || { echo "::error::HERMES_WEBHOOK_URL not configured"; exit 1; }
           [ -n "$HERMES_SECRET" ] || { echo "::error::HERMES_WEBHOOK_SECRET not configured"; exit 1; }
+          python3 --version
+          gh --version
           test -f .github/scripts/hermes_review.py
 
       - name: Run Hermes AI Security Review
@@ -437,20 +431,13 @@ jobs:
         env:
           HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
           HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
-          # The account the gateway posts the review as; the client requires
-          # the verdict comment to come from this login (created after the
-          # ask).
           HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          WAIT_SECONDS: "1800"
-          # The gateway reviewer is flaky (it fast-fails with a NOT COMPLETED
-          # placeholder instead of completing the review most of the time), so
-          # ask more than once before giving up: 5 attempts within the 30-min
-          # budget instead of the default 3 (the one completed review took ~5m,
-          # so each attempt gets a 6-min window).
-          REVIEW_ATTEMPTS: "5"
+          REPOSITORY: ${{ github.repository }}
+          WAIT_SECONDS: "1500"
+          MAX_DIFF_BYTES: "450000"
         run: |
           set -euo pipefail
           mkdir -p "$OUT"
