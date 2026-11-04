@@ -3,16 +3,18 @@
 (the facility360 devsecops standard, ported - one pipeline per app).
 
 Reads THIS run's develop-phase report artifacts (downloaded flat to
-./reports by the pr-comment job), renders ONE PR comment in the shared
-reference format (the django-gates-demo findings comment: the gate
-verdict line, the per-control table with C/H counts and the new-vs-main
-delta, the new-C/H findings section, the fixed-findings block, the
-baseline note and the run link), diffs the CRITICAL/HIGH band against the
+./reports by the pr-comment job), diffs the CRITICAL/HIGH band against the
 baseline (the latest SUCCESSFUL release run on the base branch, fetched
 via the GitHub API), and posts/updates one marker-anchored comment on the
-PR. The same rendered body is delivered as the run's Summary (the run
-page), where the C/H findings list (CRITICAL/HIGH only - Low/Medium
-stays in the downloadable report artifacts) follows.
+PR carrying the C/H findings only (the new-vs-main C/H section and the
+fixed-findings block; control status, per-control counts, the AI-review
+row and Low/Medium stay out of the PR conversation). The full reference
+format (the django-gates-demo shape: gate verdict line, per-control table
+with C/H counts and the new-vs-main delta, the new-C/H findings section,
+the fixed-findings block, the baseline note and the run link) is
+delivered as the run's Summary (the run page), where the C/H findings
+list (CRITICAL/HIGH only - Low/Medium stays in the downloadable report
+artifacts) follows.
 
 Gate: REPORT-ONLY for CRITICAL/HIGH findings (the hmis policy 2026-10-28,
 the facility360 policy 2026-10-29, adopted by this app - the app does not
@@ -425,28 +427,16 @@ def findings_items():
     return items
 
 
-def render(pr_run, baseline, bdata):
+def render(pr_run, baseline, bdata, comment_only=False):
+    # comment_only=False (the run Summary): the full reference format - the
+    # gate line, the per-control table with C/H counts and the new-vs-main
+    # delta, the C/H sections, the fixed block and the footers.
+    # comment_only=True (the PR conversation comment): the C/H findings only
+    # - control status, counts and the AI-review row stay in the run Summary
+    # and the report artifacts.
     sha = os.environ.get("HEAD_SHA") or os.environ.get("GITHUB_SHA", "")
     lines = [MARKER, "", f"## DevSecOps findings for {sha[:7]}", ""]
-    verdict = gate_verdict()
-    if verdict is not None:
-        ok, failed = verdict
-        if ok:
-            lines.append(
-                "✅ **PR gate** pass — every required control succeeded for this commit "
-                "(tests + source controls; the release G2 gate re-checks the same controls "
-                "before a release)"
-            )
-        else:
-            lines.append(
-                f"❌ **PR gate** fail — not successful: "
-                f"{', '.join('`' + k + '`' for k in failed)} (fail-closed - this run FAILS the "
-                "PR check; the same logic the G2 gate applies before a release)"
-            )
-        lines.append("")
-    lines += ["| | Control | C/H (reported) | New vs main | Detail |", "|---|---|---|---|---|"]
 
-    needs = _needs_map()
     all_items = findings_items()
     # this run's C/H identity keys per control label
     cur_keys = {}
@@ -456,42 +446,62 @@ def render(pr_run, baseline, bdata):
             cur_ch.append((label, it))
             cur_keys.setdefault(label, set()).add(_finding_key(label, it[2], it[3], it[4]))
 
-    # this run's counts (artifacts merged flat into ./reports/)
-    for label, art, _rel, _counter, unit in CONTROLS:
-        val, display = count_in_dir(REPORTS_DIR, (label, art, _rel, _counter, unit))
-        # the image-scan control is release-only (no image is built on a PR
-        # run): a missing report is the expected state, so its row is
-        # simply not rendered (unlike a missing REQUIRED control report,
-        # which is a red flag that must be shown)
-        if val is None and art == "report-image-scan":
-            continue
-        chn = blocking_count(_rel)
-        base = bdata.get(art) if bdata else None
-        if base is None or unit == "tests":
-            newcol = "–"  # no baseline for this control / no finding identity (test counts)
-        else:
-            base_keys = {k for _i, k in base.get("ch", [])}
-            newcol = str(len(cur_keys.get(label, set()) - base_keys))
-        icon = _job_icon(needs, art.removeprefix("report-"), val)
-        lines.append(f"| {icon} | {label} | {chn if chn is not None else '–'} | {newcol} | {_md_cell(display, 140)} |")
+    if not comment_only:
+        verdict = gate_verdict()
+        if verdict is not None:
+            ok, failed = verdict
+            if ok:
+                lines.append(
+                    "✅ **PR gate** pass — every required control succeeded for this commit "
+                    "(tests + source controls; the release G2 gate re-checks the same controls "
+                    "before a release)"
+                )
+            else:
+                lines.append(
+                    f"❌ **PR gate** fail — not successful: "
+                    f"{', '.join('`' + k + '`' for k in failed)} (fail-closed - this run FAILS the "
+                    "PR check; the same logic the G2 gate applies before a release)"
+                )
+            lines.append("")
+        lines += ["| | Control | C/H (reported) | New vs main | Detail |", "|---|---|---|---|---|"]
 
-    # the AI review row (advisory control - the hermes client's verdict)
-    ai_verdict, ai_ch = _ai_review_from_dir(REPORTS_DIR)
-    ai_base = bdata.get(AI_REVIEW_ART) if bdata else None
-    if ai_verdict is not None:
-        icon = {"pass": "✅", "fail": "❌", "skipped": "⏭️"}.get(ai_verdict.get("status"), "❔")
-        chn = str(len(ai_ch))
-        newcol = str(len({k for _i, k in ai_ch} - {k for _i, k in ai_base.get("ch", [])})) if ai_base else "–"
-        lines.append(f"| {icon} | {AI_REVIEW_LABEL} | {chn} | {newcol} | {_md_cell(ai_verdict.get('detail') or '', 140)} |")
-    else:
-        res = (needs.get("ai-security") or {}).get("result") if needs else None
-        if res in (None, "skipped"):
-            icon, why = "⏭️", "job skipped (or its result is not visible)"
-        elif res == "success":
-            icon, why = "⚠️", "job succeeded but no report landed"
+        needs = _needs_map()
+        # this run's counts (artifacts merged flat into ./reports/)
+        for label, art, _rel, _counter, unit in CONTROLS:
+            val, display = count_in_dir(REPORTS_DIR, (label, art, _rel, _counter, unit))
+            # the image-scan control is release-only (no image is built on a PR
+            # run): a missing report is the expected state, so its row is
+            # simply not rendered (unlike a missing REQUIRED control report,
+            # which is a red flag that must be shown)
+            if val is None and art == "report-image-scan":
+                continue
+            chn = blocking_count(_rel)
+            base = bdata.get(art) if bdata else None
+            if base is None or unit == "tests":
+                newcol = "–"  # no baseline for this control / no finding identity (test counts)
+            else:
+                base_keys = {k for _i, k in base.get("ch", [])}
+                newcol = str(len(cur_keys.get(label, set()) - base_keys))
+            icon = _job_icon(needs, art.removeprefix("report-"), val)
+            lines.append(f"| {icon} | {label} | {chn if chn is not None else '–'} | {newcol} | {_md_cell(display, 140)} |")
+
+        # the AI review row (advisory control - the hermes client's verdict)
+        ai_verdict, ai_ch = _ai_review_from_dir(REPORTS_DIR)
+        ai_base = bdata.get(AI_REVIEW_ART) if bdata else None
+        if ai_verdict is not None:
+            icon = {"pass": "✅", "fail": "❌", "skipped": "⏭️"}.get(ai_verdict.get("status"), "❔")
+            chn = str(len(ai_ch))
+            newcol = str(len({k for _i, k in ai_ch} - {k for _i, k in ai_base.get("ch", [])})) if ai_base else "–"
+            lines.append(f"| {icon} | {AI_REVIEW_LABEL} | {chn} | {newcol} | {_md_cell(ai_verdict.get('detail') or '', 140)} |")
         else:
-            icon, why = "❌", "job failed before the verdict"
-        lines.append(f"| {icon} | {AI_REVIEW_LABEL} | – | – | no report ({why}) |")
+            res = (needs.get("ai-security") or {}).get("result") if needs else None
+            if res in (None, "skipped"):
+                icon, why = "⏭️", "job skipped (or its result is not visible)"
+            elif res == "success":
+                icon, why = "⚠️", "job succeeded but no report landed"
+            else:
+                icon, why = "❌", "job failed before the verdict"
+            lines.append(f"| {icon} | {AI_REVIEW_LABEL} | – | – | no report ({why}) |")
 
     # the new-vs-main C/H section (the reference format's "new blocking"
     # section; the C/H band is this app's reported band). Like the
@@ -551,17 +561,18 @@ def render(pr_run, baseline, bdata):
         lines += ["", f"<details><summary>Fixed compared with main ({len(fixed)})</summary>", ""]
         lines += [f"- `{_md_cell(k, 150)}`" for k in fixed[:50]] + ["", "</details>"]
 
-    if bdata:
-        lines += ["", f"_New vs main_ compares with the latest successful release run on `{BASE_BRANCH}` "
-                     f"([run #{baseline['id']}]({baseline['html_url']}), {baseline.get('created_at', '?')[:10]}): "
-                     "the same finding means the same control, rule and file (line numbers ignored). "
-                     "– means main has no findings to compare with for that control._"]
-    else:
-        lines += ["", f"_No successful release run on `{BASE_BRANCH}` with comparable reports yet, "
-                     "so nothing is marked new._"]
-    lines += ["", f"Full tables (every finding, all severities) are in each job's **Summary**: "
-                  f"[run {pr_run['id']}]({pr_run['html_url']}) — the source controls scanned the PR merge ref. "
-                  "Updated in place on every run."]
+    if not comment_only:
+        if bdata:
+            lines += ["", f"_New vs main_ compares with the latest successful release run on `{BASE_BRANCH}` "
+                          f"([run #{baseline['id']}]({baseline['html_url']}), {baseline.get('created_at', '?')[:10]}): "
+                          "the same finding means the same control, rule and file (line numbers ignored). "
+                          "– means main has no findings to compare with for that control._"]
+        else:
+            lines += ["", f"_No successful release run on `{BASE_BRANCH}` with comparable reports yet, "
+                          "so nothing is marked new._"]
+        lines += ["", f"Full tables (every finding, all severities) are in each job's **Summary**: "
+                      f"[run {pr_run['id']}]({pr_run['html_url']}) — the source controls scanned the PR merge ref. "
+                      "Updated in place on every run."]
     return "\n".join(lines)
 
 
@@ -618,15 +629,17 @@ def main():
         print(f"baseline: run {baseline['id']} on {BASE_BRANCH}")
 
     body = render(pr_run, baseline, bdata)
-    if len(body) > 55000:  # GitHub comment limit is 65535 chars - keep a margin
+    comment = render(pr_run, baseline, bdata, comment_only=True)
+    if max(len(body), len(comment)) > 55000:  # GitHub comment limit 65535 - margin
         DETAIL_LIMIT = 40
         body = render(pr_run, baseline, bdata)
+        comment = render(pr_run, baseline, bdata, comment_only=True)
     existing = find_existing_comment()
     if existing:
-        api("PATCH", f"/repos/{REPO}/issues/comments/{existing['id']}", {"body": body})
+        api("PATCH", f"/repos/{REPO}/issues/comments/{existing['id']}", {"body": comment})
         print(f"updated existing findings comment {existing['id']}")
     else:
-        api("POST", f"/repos/{REPO}/issues/{PR}/comments", {"body": body})
+        api("POST", f"/repos/{REPO}/issues/{PR}/comments", {"body": comment})
         print(f"posted new findings comment on PR {PR}")
 
     # the run's Summary gets the SAME rendered body (the reference format -
