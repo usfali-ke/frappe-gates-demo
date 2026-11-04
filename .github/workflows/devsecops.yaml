@@ -262,6 +262,38 @@ jobs:
           path: sast/
           if-no-files-found: ignore
 
+      # The per-job summary (the Jenkins job-summary shape): status line +
+      # tool + counts from the report the job just produced. Fail-closed:
+      # a missing/unreadable report renders the fail line (the job itself
+      # is red on a control failure too).
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          f=sast/semgrep.json
+          {
+            echo "## Develop · SAST · semgrep summary"
+            echo ""
+            if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
+              total=$(jq '[.results[]?] | length' "$f")
+              hm=$(jq '[.results[]? | select(((.extra.severity // "")) | IN("ERROR","WARNING"))] | length' "$f")
+              errs=$(jq '[.errors[]?] | length' "$f")
+              echo "✅ sast-semgrep: pass"
+              echo ""
+              echo "Tool: semgrep 1.177.0 (p/default)"
+              echo "${hm} High/Medium of ${total} finding(s), ${errs} scan error(s)"
+            else
+              echo "❌ sast-semgrep: fail"
+              echo ""
+              echo "Tool: semgrep 1.177.0 (p/default)"
+              echo "semgrep report missing or unreadable - the tool did not complete (fail-closed)"
+            fi
+            echo ""
+            echo "The tool's own report is in the job log above and in the \`report-sast\` artifact."
+            echo ""
+            echo "Job summary generated at run-time"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   secrets:
     name: Develop · secrets (gitleaks, full history)
     runs-on: ubuntu-latest
@@ -296,6 +328,32 @@ jobs:
           name: report-secrets
           path: secrets/
           if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          f=secrets/gitleaks.json
+          {
+            echo "## Develop · secrets · gitleaks (full history) summary"
+            echo ""
+            if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
+              total=$(jq 'if type=="array" then length else ((.Leaks // .findings // []) | length) end' "$f")
+              echo "✅ secrets-gitleaks: pass"
+              echo ""
+              echo "Tool: gitleaks 8.30.1"
+              echo "${total} leak(s) in every commit reachable from this ref (values redacted)"
+            else
+              echo "❌ secrets-gitleaks: fail"
+              echo ""
+              echo "Tool: gitleaks 8.30.1"
+              echo "gitleaks report missing or unreadable - the scan did not complete (fail-closed)"
+            fi
+            echo ""
+            echo "The tool's own report is in the job log above and in the \`report-secrets\` artifact."
+            echo ""
+            echo "Job summary generated at run-time"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── trufflehog (reference parity: the second secrets tool). Working-tree
   #    source (gitleaks already covers the full git history), verification
@@ -337,6 +395,36 @@ jobs:
           name: report-secrets-th
           path: secrets-th/
           if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          f=secrets-th/thufflehog.json
+          {
+            echo "## Develop · secrets · trufflehog (verified) summary"
+            echo ""
+            # The report is NDJSON - an EMPTY file is a valid zero-finding
+            # result (unlike the JSON reports above, where empty is unreadable)
+            if [ -f "$f" ]; then
+              total=$(jq -s '[.[]?] | length' "$f" 2>/dev/null || echo 0)
+              verified=$(jq -s '[.[]? | select(.Verified == true)] | length' "$f" 2>/dev/null || echo 0)
+              unverified=$((total - verified))
+              echo "✅ secrets-trufflehog: pass"
+              echo ""
+              echo "Tool: trufflehog 3.99.7 (verified, working tree)"
+              echo "${verified} verified live credential(s), ${unverified} unverified candidate(s) in full git history"
+            else
+              echo "❌ secrets-trufflehog: fail"
+              echo ""
+              echo "Tool: trufflehog 3.99.7 (verified, working tree)"
+              echo "trufflehog report missing - the scan did not complete (fail-closed)"
+            fi
+            echo ""
+            echo "The tool's own report is in the job log above and in the \`report-secrets-th\` artifact."
+            echo ""
+            echo "Job summary generated at run-time"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Quality: ruff on the repo's own config (pyproject [tool.ruff]). The
   #    shared lib's ruff-scan runs the pinned ruff with the repo config and
@@ -380,6 +468,34 @@ jobs:
           name: report-quality
           path: quality/
           if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          f=quality/ruff.json
+          {
+            echo "## Develop · quality · ruff (lint + complexity) summary"
+            echo ""
+            if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
+              total=$(jq 'if type=="array" then length else 0 end' "$f")
+              ch=$(jq '[.[]? | select(((.code // "") | test("^[FB]")))] | length' "$f")
+              med=$(jq '[.[]? | select(((.code // "") | test("^[EW]")))] | length' "$f")
+              echo "✅ code-quality: pass"
+              echo ""
+              echo "Tool: ruff (pyproject.toml [tool.ruff.lint])"
+              echo "${total} finding(s) vs threshold 0 - ${ch} C/H-band (F/B), ${med} M-band (E/W) (findings report-only)"
+            else
+              echo "❌ code-quality: fail"
+              echo ""
+              echo "Tool: ruff (pyproject.toml [tool.ruff.lint])"
+              echo "ruff report missing or unreadable - the scan did not complete (fail-closed)"
+            fi
+            echo ""
+            echo "The tool's own report is in the job log above and in the \`report-quality\` artifact."
+            echo ""
+            echo "Job summary generated at run-time"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Hermes AI security review (hmis-style, single-delivery PULL mode):
   #    the repo-local hermes_review.py (checked out at the trusted base SHA)
@@ -448,6 +564,55 @@ jobs:
           path: reports/ai-review/
           if-no-files-found: ignore
 
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          f=reports/ai-review/verdict.json
+          {
+            echo "## Develop · AI security review (Hermes, PR) summary"
+            echo ""
+            if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
+              result=$(jq -r '.result // "unknown"' "$f")
+              case "$result" in
+                pass)
+                  echo "✅ ai-review: pass"
+                  echo ""
+                  echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
+                  echo "0 blocking finding(s) - review clean (advisory control)"
+                  ;;
+                fail)
+                  blk=$(jq -r '.blocking_findings // 0' "$f")
+                  crit=$(jq -r '.severity_counts.Critical // 0' "$f")
+                  high=$(jq -r '.severity_counts.High // 0' "$f")
+                  echo "❌ ai-review: fail (advisory job - the G1 merge gate enforces it)"
+                  echo ""
+                  echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
+                  echo "${blk} blocking finding(s): ${crit} Critical, ${high} High"
+                  ;;
+                *)
+                  echo "❌ ai-review: fail"
+                  echo ""
+                  echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
+                  echo "review not completed (status: $(jq -r '.status // "?"' "$f")) - fail-closed"
+                  ;;
+              esac
+              url=$(jq -r '.comment_url // ""' "$f")
+              if [ -n "$url" ]; then
+                echo ""
+                echo "[Hermes review comment](${url})"
+              fi
+            else
+              echo "❌ ai-review: fail"
+              echo ""
+              echo "no verdict - the job failed before the review completed (fail-closed)"
+            fi
+            echo ""
+            echo "The tool's own report is in the job log above and in the \`report-ai-review\` artifact."
+            echo ""
+            echo "Job summary generated at run-time"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ── IaC: checkov on the repo's own Dockerfile (the Dockerfile is in the
   #    checkout, so this control runs on PR runs too, and the report is a
   #    PR-required report).
@@ -486,6 +651,33 @@ jobs:
           path: iac/
           if-no-files-found: ignore
 
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          f=iac/checkov.sarif
+          {
+            echo "## Develop · IaC · checkov (Dockerfile) summary"
+            echo ""
+            if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
+              total=$(jq '[.runs[]?.results[]?] | length' "$f")
+              hm=$(jq '[.runs[]?.results[]? | select(((.level // "") | ascii_upcase) | IN("ERROR","WARNING"))] | length' "$f")
+              echo "✅ iac-checkov: pass"
+              echo ""
+              echo "Tool: checkov 3.3.20 (Dockerfile)"
+              echo "${hm} High/Medium of ${total} finding(s)"
+            else
+              echo "❌ iac-checkov: fail"
+              echo ""
+              echo "Tool: checkov 3.3.20 (Dockerfile)"
+              echo "checkov report missing or unreadable - the scan did not complete (fail-closed)"
+            fi
+            echo ""
+            echo "The tool's own report is in the job log above and in the \`report-iac\` artifact."
+            echo ""
+            echo "Job summary generated at run-time"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ── SCA (reference parity): trivy fs on the dependency manifests -
   #    requirements.txt + pyproject.toml (trivy's pip/python detection), dev
   #    deps included.
@@ -523,6 +715,33 @@ jobs:
           name: report-sca
           path: sca/
           if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          f=sca/trivy-fs.sarif
+          {
+            echo "## Develop · SCA · trivy fs (dependency manifests) summary"
+            echo ""
+            if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
+              total=$(jq '[.runs[]?.results[]?] | length' "$f")
+              ch=$(jq '[.runs[]?.results[]? | select(((.level // "") | ascii_upcase) | IN("CRITICAL","HIGH","ERROR"))] | length' "$f")
+              echo "✅ sca-trivy-fs: pass"
+              echo ""
+              echo "Tool: trivy 0.76.0 (fs - dependency manifests)"
+              echo "${ch} Critical/High of ${total} finding(s)"
+            else
+              echo "❌ sca-trivy-fs: fail"
+              echo ""
+              echo "Tool: trivy 0.76.0 (fs - dependency manifests)"
+              echo "trivy fs report missing or unreadable - the scan did not complete (fail-closed)"
+            fi
+            echo ""
+            echo "The tool's own report is in the job log above and in the \`report-sca\` artifact."
+            echo ""
+            echo "Job summary generated at run-time"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Unit tests: the app's bench suite (the Frappe test runner against a
   #    real MariaDB + Redis - the same setup the repo's own ladder uses;
@@ -608,6 +827,45 @@ jobs:
           name: report-unit-tests
           path: unit-tests/
           if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          f=unit-tests/junit.xml
+          ts=""
+          # the exact <testsuite ...> tag (the <testsuites> wrapper has no
+          # counts - a space after the tag name excludes it)
+          [ -s "$f" ] && ts=$(head -c 8000 "$f" | grep -o '<testsuite [^>]*>' | head -1)
+          {
+            echo "## Develop · unit tests + coverage summary"
+            echo ""
+            if [ -n "$ts" ]; then
+              tests=$(printf '%s' "$ts" | sed -n 's/.* tests="\([0-9][0-9]*\)".*/\1/p')
+              fails=$(printf '%s' "$ts" | sed -n 's/.* failures="\([0-9][0-9]*\)".*/\1/p')
+              errs=$(printf '%s' "$ts" | sed -n 's/.* errors="\([0-9][0-9]*\)".*/\1/p')
+              if [ -n "$tests" ] && [ "${fails:-0}" -eq 0 ] && [ "${errs:-0}" -eq 0 ]; then
+                echo "✅ unit-tests: pass"
+                echo ""
+                echo "Tool: Frappe bench test suite (real MariaDB)"
+                echo "${tests} test(s), 0 failure(s), 0 error(s) - junit in unit-tests/junit.xml"
+              else
+                echo "❌ unit-tests: fail"
+                echo ""
+                echo "Tool: Frappe bench test suite (real MariaDB)"
+                echo "${tests:-?} test(s), ${fails:-?} failure(s), ${errs:-?} error(s) - the junit report is preserved as the control's evidence"
+              fi
+            else
+              echo "❌ unit-tests: fail"
+              echo ""
+              echo "Tool: Frappe bench test suite (real MariaDB)"
+              echo "junit report missing - the suite did not complete (fail-closed)"
+            fi
+            echo ""
+            echo "The tool's own report is in the job log above and in the \`report-unit-tests\` artifact."
+            echo ""
+            echo "Job summary generated at run-time"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── G1 merge gate (the PR boundary): the single check that answers
   #    "may this merge?". Fail-closed by construction: (1) every required
@@ -1156,6 +1414,13 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: report-image-scan, path: image-scan }
+      # The AI review is PR-only (ai-security does not run on release runs):
+      # on those the artifact is absent, the download is skipped, and
+      # dojo-import skips the missing file - same as image-scan above.
+      - name: Download report-ai-review -> ai-review/
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b40e8e0b5a5461e7c # v8.0.1
+        with: { name: report-ai-review, path: ai-review }
 
       - name: Push all control reports to DefDojo (one reimport-scan per report)
         continue-on-error: true
@@ -1173,7 +1438,8 @@ jobs:
             quality/ruff.sarif \
             iac/checkov.sarif \
             sca/trivy-fs.sarif \
-            image-scan/trivy.sarif
+            image-scan/trivy.sarif \
+            ai-review/ai-review.sarif
 
       - name: DefDojo summary (findings per control -> the run summary)
         if: always()
