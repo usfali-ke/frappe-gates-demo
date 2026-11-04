@@ -1,0 +1,87 @@
+name: Calculate Version with GitVersion
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "The name of the app to version (e.g., facility360)"
+        required: true
+        type: string
+    secrets:
+      # declared here (required) so callers may pass it: reusable
+      # workflows only accept secrets declared in this mapping, and the
+      # checkout below needs it (the caller's top-level permissions: {}
+      # strips the inherited GITHUB_TOKEN scope, so GITHUB_TOKEN alone
+      # would be unscoped).
+      GIT_TOKEN:
+        description: "GitHub token for the version checkout (caller passes its own GIT_TOKEN)"
+        required: true
+    outputs:
+      semVer:
+        description: "The semantic version calculated by GitVersion"
+        value: ${{ jobs.calculate-version.outputs.semVer }}
+      majorMinorPatch:
+        description: "The major.minor.patch version"
+        value: ${{ jobs.calculate-version.outputs.majorMinorPatch }}
+      fullSemVer:
+        description: "The full semantic version with pre-release tags"
+        value: ${{ jobs.calculate-version.outputs.fullSemVer }}
+      informationalVersion:
+        description: "The informational version including git metadata"
+        value: ${{ jobs.calculate-version.outputs.informationalVersion }}
+      tagName:
+        description: "The full tag name with app prefix"
+        value: ${{ jobs.calculate-version.outputs.tagName }}
+
+jobs:
+  calculate-version:
+    runs-on: ubuntu-latest
+    outputs:
+      semVer: ${{ steps.gitversion.outputs.semVer }}
+      majorMinorPatch: ${{ steps.gitversion.outputs.majorMinorPatch }}
+      fullSemVer: ${{ steps.gitversion.outputs.fullSemVer }}
+      informationalVersion: ${{ steps.gitversion.outputs.informationalVersion }}
+      tagName: ${{ steps.set-tag.outputs.tagName }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (same pin as the devsecops pipeline)
+        with:
+          # explicit token: the calling workflows run with a top-level
+          # permissions: {} (no default GITHUB_TOKEN scope) - same pattern
+          # as the devsecops pipeline's own checkout steps
+          token: ${{ secrets.GIT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install GitVersion
+        uses: gittools/actions/gitversion/setup@8d68520cde93ca9226ee0e09870caaca033d2cd2 # v1.1.1
+        with:
+          versionSpec: '5.x'
+
+      - name: Determine Version
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@8d68520cde93ca9226ee0e09870caaca033d2cd2 # v1.1.1
+        with:
+          useConfigFile: true
+          configFilePath: GitVersion.yml
+
+      - name: Set tag name
+        id: set-tag
+        # inputs.* via step env: semgrep run-shell-injection (C/H) on
+        # ${{ inputs.* }} in run: - the accepted env-indirection fix
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          TAG_NAME="${APP_NAME}-${{ steps.gitversion.outputs.semVer }}"
+          echo "tagName=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Display GitVersion outputs
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          echo "App: $APP_NAME"
+          echo "SemVer: ${{ steps.gitversion.outputs.semVer }}"
+          echo "MajorMinorPatch: ${{ steps.gitversion.outputs.majorMinorPatch }}"
+          echo "FullSemVer: ${{ steps.gitversion.outputs.fullSemVer }}"
+          echo "InformationalVersion: ${{ steps.gitversion.outputs.informationalVersion }}"
+          echo "Full Tag Name: ${{ steps.set-tag.outputs.tagName }}"

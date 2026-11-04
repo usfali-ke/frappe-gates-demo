@@ -417,74 +417,7 @@ jobs:
           path: reports/reviewers/
           if-no-files-found: ignore
 
-  # ── Hermes AI security review (hmis-style, single-delivery PULL mode):
-  #    the repo-local hermes_review.py (checked out at the trusted base SHA)
-  #    fetches the PR diff via `gh pr diff`, HMAC-signs the event payload,
-  #    sends ONE webhook to the gateway, then polls for the PR comment.
-  #    Findings are advisory — only a technical failure (NOT COMPLETED /
-  #    timeout) fails the job. Standalone control.
-  ai-security:
-    name: Develop · AI security review (Hermes, PR)
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    env:
-      OUT: reports/ai-review
-      VERDICT_FILE: reports/ai-review/verdict.json
-    steps:
-      - name: Checkout trusted review tooling
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Verify Hermes configuration
-        env:
-          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
-          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
-        run: |
-          set -euo pipefail
-          [ -n "$HERMES_URL" ] || { echo "::error::HERMES_WEBHOOK_URL not configured"; exit 1; }
-          [ -n "$HERMES_SECRET" ] || { echo "::error::HERMES_WEBHOOK_SECRET not configured"; exit 1; }
-          python3 --version
-          gh --version
-          test -f .github/scripts/hermes_review.py
-
-      - name: Run Hermes AI Security Review
-        id: verdict
-        env:
-          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
-          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
-          HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          REPOSITORY: ${{ github.repository }}
-          WAIT_SECONDS: "1500"
-          MAX_DIFF_BYTES: "450000"
-        run: |
-          set -euo pipefail
-          mkdir -p "$OUT"
-          python3 .github/scripts/hermes_review.py
-
-      - name: Upload AI Review Report
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: report-ai-review
-          path: reports/ai-review/
-          if-no-files-found: ignore
+  # ── Hermes AI security review now lives in devsecops.yaml (`ai-security`).
 
   commits-signed:
     name: Develop · governance · signed commits
@@ -534,8 +467,8 @@ jobs:
 
   gate-g1:
     name: G1 merge gate (Develop → Build)
-    # ai-security (Hermes) is advisory — findings never block a merge — so
-    # it is not a gate input here.
+    # ai-security (Hermes, in devsecops.yaml) is advisory — findings never
+    # block a merge — so it is not a gate input here.
     needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed]
     if: always() && startsWith(github.event_name, 'pull_request')
     runs-on: ubuntu-latest
