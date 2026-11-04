@@ -639,12 +639,10 @@ def main():
         with open(summary_path, "a") as fh:
             fh.write(body)
             if ch_items:
-                fh.write("\n\n## C/H findings (this run — CRITICAL/HIGH only; "
-                         "Low/Medium: download the report-* artifacts)\n\n")
+                fh.write("\n\n## C/H findings\n\n")
                 fh.write(_all_findings_md(ch_items))
             else:
-                fh.write("\n\n_No CRITICAL/HIGH findings in this run's reports "
-                         "(Low/Medium: download the report-* artifacts)._\n")
+                fh.write("\n\n_No CRITICAL/HIGH findings in this run's reports._\n")
 
     # ── PR findings gate (REPORT-ONLY for CRITICAL/HIGH): findings are
     #    graded + listed but never fail the check; the run FAILS when a
