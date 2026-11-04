@@ -534,9 +534,8 @@ jobs:
 
   gate-g1:
     name: G1 merge gate (Develop → Build)
-    # ai-review is deliberately not listed: its job is commented out above, and
-    # a `needs` naming a job that does not exist makes the whole workflow
-    # invalid (GitHub then runs nothing at all). The criterion is recorded as
+    # ai-review is deliberately not listed: it is advisory (Hermes findings
+    # never block a merge), not a gate input. The criterion is recorded as
     # skipped-with-reason by gate.py, not silently passed.
     needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed]
     if: always() && startsWith(github.event_name, 'pull_request')
