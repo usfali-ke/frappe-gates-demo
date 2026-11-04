@@ -609,6 +609,68 @@ jobs:
           path: unit-tests/
           if-no-files-found: ignore
 
+  # ── G1 merge gate (the PR boundary): the single check that answers
+  #    "may this merge?". Fail-closed by construction: (1) every required
+  #    Develop control must have SUCCEEDED (a failed or skipped control
+  #    blocks), and (2) the AI security review verdict must be PASS (no
+  #    Critical/High findings - the app's C/H enforcement at the merge
+  #    boundary). Static-control findings stay report-only (f360/hmis
+  #    policy - a control job is red on control FAILURE, not on findings).
+  #    DefDojo is deliberately NOT a gate input: it is a best-effort
+  #    reporting sink that never blocks. ────────────────────────────────
+  gate-g1:
+    name: G1 merge gate (Develop → PR merge, fail-closed)
+    if: always() && github.event_name == 'pull_request'
+    needs: [sast, secrets, secrets-th, quality, iac, sca, unit-tests, ai-security]
+    timeout-minutes: 5
+    steps:
+      # The AI review verdict (for the gate's own message). Best-effort by
+      # design: the authoritative C/H signal is the ai-security job OUTPUT
+      # (written by the trusted client before it exits); the artifact only
+      # enriches the verdict text with the finding counts.
+      - name: Download the AI review report (gate message input)
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: report-ai-review
+          path: reports/ai-review
+
+      - name: Gate verdict (every control succeeded? AI review clean?)
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          # 1) Every required Develop control must be success (a failed or
+          #    skipped control blocks the merge - fail-closed).
+          not_ready=$(jq -r 'to_entries | map(select(.value.result != "success") | .key) | join(", ")' <<<"$NEEDS")
+          if [ -n "$not_ready" ]; then
+            echo "::error::G1 gate FAILED - control(s) not successful: $not_ready - merge blocked (fail-closed)"
+            exit 1
+          fi
+          # 2) The AI security review verdict (the client writes
+          #    pass/fail/error as the job OUTPUT before it exits - that is
+          #    authoritative): fail = Critical/High findings present
+          #    (blocking, per the merge-boundary policy); anything
+          #    unreadable blocks (fail-closed).
+          ai_result=$(jq -r '.["ai-security"].outputs.result // empty' <<<"$NEEDS")
+          case "$ai_result" in
+            fail)
+              counts="unknown"
+              if [ -f reports/ai-review/verdict.json ]; then
+                counts=$(jq -r '"\(.blocking_findings) blocking (\(.severity_counts.Critical // 0) Critical, \(.severity_counts.High // 0) High)"' reports/ai-review/verdict.json)
+              fi
+              echo "::error::G1 gate FAILED - AI security review reported $counts finding(s) - merge blocked (see the Hermes review comment + report-ai-review)"
+              exit 1
+              ;;
+            pass) ;;
+            *)
+              echo "::error::G1 gate FAILED - AI review verdict unreadable ('$ai_result') - merge blocked (fail-closed)"
+              exit 1
+              ;;
+          esac
+          echo "G1 gate: all controls succeeded; AI review clean (no Critical/High) - merge allowed"
+
   # ── Build phase, part 2: the IMAGE controls that run in PARALLEL against
   #    the built image (one parallel job per control - the Jenkins imageScan
   #    branches). Each job reads the version from the shared version job
