@@ -529,7 +529,7 @@ def render(pr_run, baseline, bdata, comment_only=False):
             if carried:
                 lines.append(f"_{carried} C/H finding(s) carried over from main - the full list is in the job summary._")
     else:
-        lines += ["", f"### C/H findings in this PR ({len(cur_ch)}) — first run, no baseline to compare", ""]
+        lines += ["", f"### C/H findings in this PR ({len(cur_ch)})", ""]
         if cur_ch:
             _ch_table(lines, cur_ch)
         else:
@@ -573,6 +573,9 @@ def render(pr_run, baseline, bdata, comment_only=False):
         lines += ["", f"Full tables (every finding, all severities) are in each job's **Summary**: "
                       f"[run {pr_run['id']}]({pr_run['html_url']}) — the source controls scanned the PR merge ref. "
                       "Updated in place on every run."]
+    else:
+        lines += ["", f"_All other findings (all severities): download the `report-*` artifacts from "
+                      f"[run {pr_run['id']}]({pr_run['html_url']})._"]
     return "\n".join(lines)
 
 
