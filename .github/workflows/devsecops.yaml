@@ -620,6 +620,7 @@ jobs:
   #    reporting sink that never blocks. ────────────────────────────────
   gate-g1:
     name: G1 merge gate (Develop → PR merge, fail-closed)
+    runs-on: ubuntu-latest
     if: always() && github.event_name == 'pull_request'
     needs: [sast, secrets, secrets-th, quality, iac, sca, unit-tests, ai-security]
     timeout-minutes: 5
