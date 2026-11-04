@@ -398,6 +398,7 @@ DETAIL_LIMIT = 120
 
 # severity ordering for the per-finding tables (blocking first, by severity)
 _SEV_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+_SEV_BY_RANK = {v: k for k, v in _SEV_RANK.items()}
 
 
 def _sev_rank(sev):
@@ -521,19 +522,20 @@ def render(pr_run, baseline, bdata, comment_only=False):
             1 for l, it in cur_ch
             if l in compared_labels and _finding_key(l, it[2], it[3], it[4]) in base_keys_all
         )
-        lines += ["", f"### New C/H findings in this PR ({len(new_items)})", ""]
-        if new_items:
-            _ch_table(lines, new_items)
-        else:
-            lines.append("_no new C/H findings vs the baseline_")
-            if carried:
-                lines.append(f"_{carried} C/H finding(s) carried over from main - the full list is in the job summary._")
+        note = "_no new C/H findings vs the baseline_"
+        if carried:
+            note += (
+                f" ({carried} C/H finding(s) carried over from main - "
+                "the full list is in the job summary)"
+            )
+        _render_ch_section(
+            lines, f"### New C/H findings in this PR ({len(new_items)})",
+            new_items, note,
+        )
     else:
-        lines += ["", f"### C/H findings in this PR ({len(cur_ch)})", ""]
-        if cur_ch:
-            _ch_table(lines, cur_ch)
-        else:
-            lines.append("_no CRITICAL/HIGH findings in this run's reports_")
+        _render_ch_section(
+            lines, f"### C/H findings in this PR ({len(cur_ch)})", cur_ch,
+        )
 
     # fixed findings (baseline C/H identities absent from this run) - only
     # for controls present in this run (a missing report means the control
@@ -579,14 +581,79 @@ def render(pr_run, baseline, bdata, comment_only=False):
     return "\n".join(lines)
 
 
+def _tool_display(label, tool):
+    """The per-tool display name for a finding row (the AI review is the
+    one whose tool string comes from the generic SARIF parser)."""
+    if label == AI_REVIEW_LABEL:
+        return "AI review (Hermes)"
+    return tool or label
+
+
+def _per_tool_line(items):
+    """'per tool — semgrep: 1 · ruff: 1 · AI review (Hermes): 3'."""
+    by_tool = {}
+    for label, it in items:
+        name = _tool_display(label, it[1])
+        by_tool[name] = by_tool.get(name, 0) + 1
+    return "per tool — " + " · ".join(
+        f"{name}: {n}" for name, n in sorted(by_tool.items())
+    )
+
+
+def _dupe_rows(items):
+    """C/H findings which look like dupes: the same file:line flagged by
+    2+ distinct tools. The same tool flagging a line twice with different
+    rules is NOT a dupe - those stay separate findings in the table.
+    Returns [(where, [(tool, worst-sev), ...]), ...] sorted by location."""
+    groups = {}
+    for label, (sev, tool, _rule, loc, _detail) in items:
+        if ":" not in loc:
+            continue
+        file, line = loc.rsplit(":", 1)
+        file, line = file.strip(), line.strip()
+        name = _tool_display(label, tool)
+        band = groups.setdefault((file, line), {})
+        rank = _sev_rank(sev)
+        if name not in band or rank < band[name]:
+            band[name] = rank
+    rows = []
+    for (file, line), band in groups.items():
+        if len(band) >= 2:
+            tools = sorted(
+                (name, _SEV_BY_RANK[rank]) for name, rank in band.items()
+            )
+            rows.append(
+                (f"`{file}:{line}`", ", ".join(f"{t} ({s})" for t, s in tools))
+            )
+    rows.sort()
+    return rows
+
+
 def _ch_table(lines, items):
     # CRITICAL first, then HIGH - blocking findings on top
     ordered = sorted(items, key=lambda p: (_sev_rank(p[1][0]), p[0]))
-    lines += ["| Control | Severity | Finding | Where | Detail |", "|---|---|---|---|---|"]
-    for label, (sev, _tool, rule, loc, detail) in ordered[:30]:
-        lines.append(f"| {_md_cell(label, 40)} | {sev} | `{_md_cell(rule, 60)}` | `{_md_cell(loc, 80)}` | {_md_cell(detail, DETAIL_LIMIT)} |")
+    lines += ["| Tool | Severity | Finding | Where | Detail |", "|---|---|---|---|---|"]
+    for label, (sev, tool, rule, loc, detail) in ordered[:30]:
+        lines.append(f"| {_md_cell(_tool_display(label, tool), 40)} | {sev} | `{_md_cell(rule, 60)}` | `{_md_cell(loc, 80)}` | {_md_cell(detail, DETAIL_LIMIT)} |")
     if len(ordered) > 30:
         lines.append(f"\n…and {len(ordered) - 30} more: see the job summaries.")
+
+
+def _render_ch_section(lines, title, items, note=None):
+    """The C/H findings section: the per-tool breakdown, the findings
+    table (per tool), and the looks-like-dupes block (the same file:line
+    flagged by 2+ distinct tools)."""
+    lines += ["", title, ""]
+    if items:
+        lines += [_per_tool_line(items), ""]
+        _ch_table(lines, items)
+        dupes = _dupe_rows(items)
+        if dupes:
+            lines += ["", "### Looks like dupes (same file:line, 2+ tools)", ""]
+            lines += ["| Where | Tools (worst severity) |", "|---|---|"]
+            lines += ["| %s | %s |" % (where, tools) for where, tools in dupes]
+    else:
+        lines.append(note or "_no CRITICAL/HIGH findings in this run's reports_")
 
 
 def _all_findings_md(items):

@@ -424,6 +424,123 @@ def parse_review(comment: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Parse the findings table (per-finding detail for ai-review.sarif)
+# ---------------------------------------------------------------------------
+
+FINDING_ROW_RE = re.compile(
+    r"^\|\s*(Critical|High|Medium|Low)\s*\|"
+    r"\s*([^|]+?)\s*\|"
+    r"\s*([^|]*?)\s*\|"
+    r"\s*([^|]*?)\s*\|\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_findings(body: str) -> list[dict]:
+    """The security-findings table of the review comment as per-finding
+    dicts (severity, file, line, issue, fix)."""
+
+    findings = []
+
+    for match in FINDING_ROW_RE.finditer(body):
+        severity = match.group(1).capitalize()
+        location = match.group(2).strip()
+
+        file, sep, line = location.rpartition(":")
+        if sep and line.isdigit():
+            file = file.strip() or location
+            line = int(line)
+        else:
+            file, line = location, None
+
+        findings.append({
+            "severity": severity,
+            "file": file,
+            "line": line,
+            "issue": match.group(3).strip(),
+            "fix": match.group(4).strip(),
+        })
+
+    return findings
+
+
+SARIF_LEVEL_BY_SEVERITY = {
+    "Critical": "critical",
+    "High": "high",
+    "Medium": "warning",
+    "Low": "note",
+}
+
+
+def build_sarif(findings: list[dict]) -> dict:
+    """SARIF 2.1.0 for the review findings. Consumed by pr_findings.py /
+    gate_findings.py through the standard SARIF path (level/ruleId/
+    physicalLocation) and, later, by the DefDojo reimport-scan. The rule id
+    encodes the severity (the renderer's AI-review key carries the location
+    and message, so same-file findings never collapse)."""
+
+    rules = []
+    seen = set()
+    for finding in findings:
+        rule_id = "hermes.ai-review." + finding["severity"].lower()
+        if rule_id not in seen:
+            seen.add(rule_id)
+            rules.append({
+                "id": rule_id,
+                "name": "Hermes AI security review finding ("
+                         + finding["severity"] + ")",
+                "shortDescription": {
+                    "text": finding["severity"]
+                             + " finding reported by the Hermes AI security "
+                               "review",
+                },
+            })
+
+    results = []
+    for finding in findings:
+        text = finding["issue"]
+        if finding["fix"]:
+            text = (text + " Suggested fix: " + finding["fix"]).strip()
+        physical = {"artifactLocation": {"uri": finding["file"]}}
+        if finding["line"]:
+            physical["region"] = {"startLine": finding["line"]}
+        results.append({
+            "ruleId": "hermes.ai-review." + finding["severity"].lower(),
+            "level": SARIF_LEVEL_BY_SEVERITY[finding["severity"]],
+            "message": {"text": text},
+            "locations": [{"physicalLocation": physical}],
+        })
+
+    return {
+        "version": "2.1.0",
+        "$schema":
+            "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/"
+            "master/Schemata/sarif-schema-2.1.0.json",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "Hermes AI Security Review",
+                    "informationUri": "https://hermes.usfali.com",
+                    "version": "1.0",
+                    "rules": rules,
+                }
+            },
+            "results": results,
+        }],
+    }
+
+
+def write_sarif(findings: list[dict]) -> Path:
+    OUT.mkdir(parents=True, exist_ok=True)
+    path = OUT / "ai-review.sarif"
+    path.write_text(
+        json.dumps(build_sarif(findings), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -461,6 +578,14 @@ def main() -> None:
         comment = wait_for_review_comment()
 
         assessment = parse_review(comment)
+
+        if assessment["status"] == "completed":
+            findings = parse_findings(comment.get("body") or "")
+            sarif_path = write_sarif(findings)
+            log(
+                f"Findings persisted: {len(findings)} "
+                f"-> {sarif_path}"
+            )
 
         verdict = {
             "repository": REPOSITORY,
