@@ -1468,47 +1468,23 @@ jobs:
             "https://x-access-token:${GIT_TOKEN}@github.com/tiberbu/devsecops-release-lib.git" "$LIB"
           test -f "$LIB/resources/devsecops-gh.sh" || exit 1
 
-      # One download per report artifact into its OWN folder (NOT
-      # merge-multiple: the artifact zips keep the files at the zip root -
-      # a single merged download would flatten them and the dojo-import
-      # paths would not resolve). continue-on-error: a missing artifact
-      # (a crashed control) is skipped by dojo-import, it must not fail the
-      # job.
-      - name: Download report-sast -> sast/
+      # ONE pattern download (a single action resolution, not eight): the
+      # previous eight per-artifact download steps made this job's action
+      # resolution fail with "Unable to resolve action
+      # actions/download-artifact@..." at setup while single-download jobs
+      # (G1, pr-comment) resolved the same pin fine in the same run.
+      # merge-multiple: false so each artifact lands in its OWN folder (the
+      # zips keep files at the zip root - merging would flatten them and the
+      # dojo-import paths would not resolve). continue-on-error: a missing
+      # artifact (a crashed control, or the PR-only ai-review on a release
+      # run) simply has no folder - dojo-import skips it per-file.
+      - name: Download all report-* artifacts (one per control, per-artifact folders)
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with: { name: report-sast, path: sast }
-      - name: Download report-secrets -> secrets/
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with: { name: report-secrets, path: secrets }
-      - name: Download report-secrets-th -> secrets-th/
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with: { name: report-secrets-th, path: secrets-th }
-      - name: Download report-quality -> quality/
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with: { name: report-quality, path: quality }
-      - name: Download report-iac -> iac/
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with: { name: report-iac, path: iac }
-      - name: Download report-sca -> sca/
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with: { name: report-sca, path: sca }
-      - name: Download report-image-scan -> image-scan/
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with: { name: report-image-scan, path: image-scan }
-      # The AI review is PR-only (ai-security does not run on release runs):
-      # on those the artifact is absent, the download is skipped, and
-      # dojo-import skips the missing file - same as image-scan above.
-      - name: Download report-ai-review -> ai-review/
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b40e8e0b5a5461e7c # v8.0.1
-        with: { name: report-ai-review, path: ai-review }
+        with:
+          pattern: report-*
+          merge-multiple: false
+          path: reports
 
       - name: Push all control reports to DefDojo (one reimport-scan per report)
         continue-on-error: true
@@ -1520,14 +1496,14 @@ jobs:
           # product; the continue-on-error above keeps the run green either
           # way (DefDojo is a reporting sink, not a release control).
           bash "$LIB/resources/devsecops-gh.sh" dojo-import \
-            sast/semgrep.sarif \
-            secrets/gitleaks.sarif \
-            secrets-th/trufflehog.sarif \
-            quality/ruff.sarif \
-            iac/checkov.sarif \
-            sca/trivy-fs.sarif \
-            image-scan/trivy.sarif \
-            ai-review/ai-review.sarif
+            reports/report-sast/semgrep.sarif \
+            reports/report-secrets/gitleaks.sarif \
+            reports/report-secrets-th/trufflehog.sarif \
+            reports/report-quality/ruff.sarif \
+            reports/report-iac/checkov.sarif \
+            reports/report-sca/trivy-fs.sarif \
+            reports/report-image-scan/trivy.sarif \
+            reports/report-ai-review/ai-review.sarif
 
       - name: DefDojo summary (findings per control -> the run summary)
         if: always()
@@ -1544,13 +1520,14 @@ jobs:
             echo "| Control | Findings | Report |"
             echo "|---|---|---|"
             for pair in \
-              "SAST (semgrep):sast/semgrep.sarif" \
-              "Secrets (gitleaks, full history):secrets/gitleaks.sarif" \
-              "Secrets (trufflehog, verified):secrets-th/trufflehog.sarif" \
-              "Quality (ruff):quality/ruff.sarif" \
-              "IaC (checkov):iac/checkov.sarif" \
-              "SCA (trivy fs, dependency manifests):sca/trivy-fs.sarif" \
-              "Image scan (trivy):image-scan/trivy.sarif"; do
+              "SAST (semgrep):reports/report-sast/semgrep.sarif" \
+              "Secrets (gitleaks, full history):reports/report-secrets/gitleaks.sarif" \
+              "Secrets (trufflehog, verified):reports/report-secrets-th/trufflehog.sarif" \
+              "Quality (ruff):reports/report-quality/ruff.sarif" \
+              "IaC (checkov):reports/report-iac/checkov.sarif" \
+              "SCA (trivy fs, dependency manifests):reports/report-sca/trivy-fs.sarif" \
+              "Image scan (trivy):reports/report-image-scan/trivy.sarif" \
+              "AI review (Hermes, PR-only):reports/report-ai-review/ai-review.sarif"; do
               label="${pair%%:*}"
               path="${pair#*:}"
               if [ ! -s "$path" ]; then
