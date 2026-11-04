@@ -386,13 +386,11 @@ jobs:
   #    fetches the PR diff via `gh pr diff`, HMAC-signs the event payload,
   #    sends ONE webhook to the gateway, then polls for the PR comment.
   #    Findings are advisory — only a technical failure (NOT COMPLETED /
-  #    timeout) fails the job. Standalone control.
+  #    timeout) fails the job. Runs on every pull request like the other
+  #    Develop controls (there is no push-mode variant: no PR, no review).
   ai-security:
     name: Develop · AI security review (Hermes, PR)
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -1167,12 +1165,13 @@ jobs:
     runs-on: ubuntu-latest
     # PR runs only; always() so the comment still posts (with failures
     # marked) when a needed control did not succeed. Hermes (`ai-security`)
-    # is advisory and posts its own PR comment directly, so it isn't a
-    # `needs` here. The image-scan
-    # control is release-only (no image is built on a PR), so it is NOT a
-    # need and its row renders only when a report is present.
+    # is a need like the other security controls: the comment waits for it
+    # and renders its state (its C/H findings stay advisory - only a
+    # control failure, e.g. NOT COMPLETED, surfaces as failed). The
+    # image-scan control is release-only (no image is built on a PR), so it
+    # is NOT a need and its row renders only when a report is present.
     if: always() && github.event_name == 'pull_request'
-    needs: [sast, secrets, secrets-th, quality, iac, sca, unit-tests]
+    needs: [sast, secrets, secrets-th, quality, iac, sca, unit-tests, ai-security]
     timeout-minutes: 15
     permissions:
       contents: read
