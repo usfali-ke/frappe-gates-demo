@@ -284,7 +284,10 @@ def list_findings(path, tool, detail_limit=120):
                 except ValueError:
                     continue
                 loc_obj = d.get("Location") or {}
-                loc = "%s:%s" % (loc_obj.get("Path", "?"), loc_obj.get("Line", "?"))
+                # trufflehog v3's location object is {type, value, path,
+                # repository} - the line number is "value" (there is no
+                # "line" field; reading it always rendered "path:?").
+                loc = "%s:%s" % (loc_obj.get("Path", "?"), loc_obj.get("Value", "?"))
                 sev = "CRITICAL" if d.get("Verified") is True else "MEDIUM"
                 out.append((sev, tool, d.get("DetectorName", "?"), loc, d.get("Description", "")))
     elif tool in ("trivy", "checkov"):
