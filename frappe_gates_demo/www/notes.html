@@ -7,8 +7,8 @@
 	<div class="page-header">
 		<h1>{{ title }}</h1>
 		<p class="text-muted">
-			Signed in as {{ full_name }} &middot; {{ stats.open }} open of {{ stats.total }} notes
-			{% if stats.highest_open_severity %}&middot; highest open: {{ stats.highest_open_severity }}{% endif %}
+			Signed in as {{ full_name }} &middot; {{ stats.open }} of {{ stats.total }} notes open
+			{% if stats.highest_open_severity %}&middot; highest open severity: {{ stats.highest_open_severity }}{% endif %}
 		</p>
 	</div>
 
