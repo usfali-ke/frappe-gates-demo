@@ -282,25 +282,6 @@ jobs:
               echo ""
               echo "Tool: semgrep 1.177.0 (p/default)"
               echo "${hm} High/Medium of ${total} finding(s), ${errs} scan error(s)"
-              ch_list=$(jq -r '[.results[]? | select((.extra.severity // "") == "ERROR")] | .[:10][] | "| `\(.path // "?"):\(.start.line // "?")` | `\(.check_id // "?")` | \(((.extra.message) // "") | gsub("[\n\r]+"; " ") | gsub("[|]"; "\\|") | .[0:120]) |"' "$f" 2>/dev/null)
-              ch_total=$(jq '[.results[]? | select((.extra.severity // "") == "ERROR")] | length' "$f" 2>/dev/null || echo 0)
-              if [ -n "$ch_list" ]; then
-                echo ""
-                echo "**Critical/High findings:**"
-                echo ""
-                echo "| Location | Rule | Detail |"
-                echo "|---|---|---|"
-                echo "$ch_list"
-                if [ "${ch_total:-0}" -gt 10 ] 2>/dev/null; then
-                  echo "…and $((ch_total - 10)) more - the full list is in the \`report-sast\` artifact."
-                else
-                  echo ""
-                  echo "The full list (all severities) is in the \`report-sast\` artifact."
-                fi
-              else
-                echo ""
-                echo "_no Critical/High findings in this run - the full list (all severities) is in the \`report-sast\` artifact._"
-              fi
             else
               echo "❌ sast-semgrep: fail"
               echo ""
@@ -312,6 +293,7 @@ jobs:
             echo ""
             echo "Job summary generated at run-time"
           } >> "$GITHUB_STEP_SUMMARY"
+
 
 
 
@@ -364,24 +346,6 @@ jobs:
               echo ""
               echo "Tool: gitleaks 8.30.1"
               echo "${total} leak(s) in every commit reachable from this ref (values redacted)"
-              ch_list=$(jq -r '(if type=="array" then . else (.Leaks // .findings // []) end)[] | "| `\(.File // "?"):\(.StartLine // "?")` | `\(.RuleID // "?")` | \(((.Description) // "") | gsub("[\n\r]+"; " ") | gsub("[|]"; "\\|") | .[0:120]) |"' "$f" 2>/dev/null | head -10)
-              if [ -n "$ch_list" ]; then
-                echo ""
-                echo "**Leak(s) (each leak is a C/H-grade security finding):**"
-                echo ""
-                echo "| Location | Rule | Detail |"
-                echo "|---|---|---|"
-                echo "$ch_list"
-                if [ "$total" -gt 10 ] 2>/dev/null; then
-                  echo "…and $((total - 10)) more - the full list is in the \`report-secrets\` artifact."
-                else
-                  echo ""
-                  echo "The full list (all severities) is in the \`report-secrets\` artifact."
-                fi
-              else
-                echo ""
-                echo "_no leaks in this run - the full list is in the \`report-secrets\` artifact._"
-              fi
             else
               echo "❌ secrets-gitleaks: fail"
               echo ""
@@ -393,6 +357,14 @@ jobs:
             echo ""
             echo "Job summary generated at run-time"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── trufflehog (reference parity: the second secrets tool). Working-tree
+  #    source (gitleaks already covers the full git history), verification
+  #    ON by default. The lib strips Raw before the reports are stored and
+  #    generates the SARIF. Wrapper exit contract: 0 = scan complete
+  #    (findings, if any, are recorded in the reports), non-zero = scan
+  #    crash (fail-closed).
+
 
 
   secrets-th:
@@ -438,6 +410,8 @@ jobs:
           {
             echo "## Develop · secrets · trufflehog (verified) summary"
             echo ""
+            # The report is NDJSON - an EMPTY file is a valid zero-finding
+            # result (unlike the JSON reports above, where empty is unreadable)
             if [ -f "$f" ]; then
               total=$(jq -s '[.[]?] | length' "$f" 2>/dev/null || echo 0)
               verified=$(jq -s '[.[]? | select(.Verified == true)] | length' "$f" 2>/dev/null || echo 0)
@@ -446,24 +420,6 @@ jobs:
               echo ""
               echo "Tool: trufflehog 3.99.7 (verified, working tree)"
               echo "${verified} verified live credential(s), ${unverified} unverified candidate(s) in full git history"
-              ch_list=$(jq -rs '.[]? | select(.Verified == true) | "| `\(((.Location // {}).Path) // "?"):\(((.Location // {}).Value) // "?")` | `\(.DetectorName // "?")` | \(((.Description) // "") | gsub("[\n\r]+"; " ") | gsub("[|]"; "\\|") | .[0:120]) |"' "$f" 2>/dev/null | head -10)
-              if [ -n "$ch_list" ]; then
-                echo ""
-                echo "**Verified (Critical) credential(s):**"
-                echo ""
-                echo "| Location | Rule | Detail |"
-                echo "|---|---|---|"
-                echo "$ch_list"
-                if [ "$verified" -gt 10 ] 2>/dev/null; then
-                  echo "…and $((verified - 10)) more - the full list is in the \`report-secrets-th\` artifact."
-                else
-                  echo ""
-                  echo "The full list (all severities) is in the \`report-secrets-th\` artifact."
-                fi
-              else
-                echo ""
-                echo "_no verified credentials in this run - the full list is in the \`report-secrets-th\` artifact._"
-              fi
             else
               echo "❌ secrets-trufflehog: fail"
               echo ""
@@ -475,6 +431,16 @@ jobs:
             echo ""
             echo "Job summary generated at run-time"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Quality: ruff on the repo's own config (pyproject [tool.ruff]). The
+  #    shared lib's ruff-scan runs the pinned ruff with the repo config and
+  #    writes JSON + SARIF; the lib's wrapper exit contract is "0 = scan
+  #    complete, non-zero = scan crash" - so the job fails on a ruff that
+  #    CANNOT run (fail-closed control health), and the findings themselves
+  #    are graded by the findings gate (F/B -> HIGH, E/W -> MEDIUM,
+  #    I/UP/RUF -> LOW; REPORT-ONLY - the policy for this app, like every
+  #    other tool in this pipeline).
+
 
 
   quality:
@@ -528,26 +494,6 @@ jobs:
               echo ""
               echo "Tool: ruff (pyproject.toml [tool.ruff.lint])"
               echo "${total} finding(s) vs threshold 0 - ${ch} C/H-band (F/B), ${med} M-band (E/W) (findings report-only)"
-              # ruff emits absolute paths; strip the runner workspace prefix so
-              # the location reads repo-relative like every other tool
-              ch_list=$(jq -r --arg ws "$GITHUB_WORKSPACE" '[.[]? | select(((.code // "") | test("^[FB]")))] | .[:10][] | "| `\(((.filename // "?")) | if startswith($ws + "/") then .[(($ws | length) + 1):] else . end ):\(((.location // {}).row) // "?")` | `\(.code)` | \(((.message) // "") | gsub("[\n\r]+"; " ") | gsub("[|]"; "\\|") | .[0:120]) |"' "$f" 2>/dev/null)
-              if [ -n "$ch_list" ]; then
-                echo ""
-                echo "**Critical/High findings (F/B rules):**"
-                echo ""
-                echo "| Location | Rule | Detail |"
-                echo "|---|---|---|"
-                echo "$ch_list"
-                if [ "$ch" -gt 10 ] 2>/dev/null; then
-                  echo "…and $((ch - 10)) more - the full list is in the \`report-quality\` artifact."
-                else
-                  echo ""
-                  echo "The full list (all severities) is in the \`report-quality\` artifact."
-                fi
-              else
-                echo ""
-                echo "_no C/H-band findings in this run - the full list (all severities) is in the \`report-quality\` artifact._"
-              fi
             else
               echo "❌ code-quality: fail"
               echo ""
@@ -559,6 +505,15 @@ jobs:
             echo ""
             echo "Job summary generated at run-time"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Hermes AI security review (hmis-style, single-delivery PULL mode):
+  #    the repo-local hermes_review.py (checked out at the trusted base SHA)
+  #    fetches the PR diff via `gh pr diff`, HMAC-signs the event payload,
+  #    sends ONE webhook to the gateway, then polls for the PR comment.
+  #    Findings are advisory — only a technical failure (NOT COMPLETED /
+  #    timeout) fails the job. Runs on every pull request like the other
+  #    Develop controls (there is no push-mode variant: no PR, no review).
+
 
 
   ai-security:
@@ -626,7 +581,6 @@ jobs:
         run: |
           set -uo pipefail
           f=reports/ai-review/verdict.json
-          f2=reports/ai-review/ai-review.sarif
           {
             echo "## Develop · AI security review (Hermes, PR) summary"
             echo ""
@@ -638,8 +592,6 @@ jobs:
                   echo ""
                   echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
                   echo "0 blocking finding(s) - review clean (advisory control)"
-                  echo ""
-                  echo "_no Critical/High findings in this run - the full list (all severities) is in the \`report-ai-review\` artifact._"
                   ;;
                 fail)
                   blk=$(jq -r '.blocking_findings // 0' "$f")
@@ -649,24 +601,6 @@ jobs:
                   echo ""
                   echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
                   echo "${blk} blocking finding(s): ${crit} Critical, ${high} High"
-                  if [ -s "$f2" ] && jq -e . "$f2" >/dev/null 2>&1; then
-                    ch_list=$(jq -r '[.runs[]?.results[]? | select(((.level // "") | ascii_upcase) | IN("CRITICAL","HIGH"))] | .[:10][] | "| `\(((.locations[0].physicalLocation.artifactLocation // {}).uri) // "?"):\(((.locations[0].physicalLocation.region // {}).startLine) // "?")` | \(.level // "?") | \((((.message // {}).text) // "") | gsub("[\n\r]+"; " ") | gsub("[|]"; "\\|") | .[0:120]) |"' "$f2" 2>/dev/null)
-                    ch_total=$(jq '[.runs[]?.results[]? | select(((.level // "") | ascii_upcase) | IN("CRITICAL","HIGH"))] | length' "$f2" 2>/dev/null || echo 0)
-                    if [ -n "$ch_list" ]; then
-                      echo ""
-                      echo "**Critical/High findings:**"
-                      echo ""
-                      echo "| Location | Severity | Detail |"
-                      echo "|---|---|---|"
-                      echo "$ch_list"
-                      if [ "${ch_total:-0}" -gt 10 ] 2>/dev/null; then
-                        echo "…and $((ch_total - 10)) more - the full list is in the \`report-ai-review\` artifact."
-                      else
-                        echo ""
-                        echo "The full list (all severities) is in the \`report-ai-review\` artifact."
-                      fi
-                    fi
-                  fi
                   ;;
                 *)
                   echo "❌ ai-review: fail"
@@ -690,6 +624,11 @@ jobs:
             echo ""
             echo "Job summary generated at run-time"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── IaC: checkov on the repo's own Dockerfile (the Dockerfile is in the
+  #    checkout, so this control runs on PR runs too, and the report is a
+  #    PR-required report).
+
 
 
   iac:
@@ -742,25 +681,6 @@ jobs:
               echo ""
               echo "Tool: checkov 3.3.20 (Dockerfile)"
               echo "${hm} High/Medium of ${total} finding(s)"
-              ch_list=$(jq -r '[.runs[]?.results[]? | select(((.level // "") | ascii_upcase) == "ERROR")] | .[:10][] | "| `\(((.locations[0].physicalLocation.artifactLocation // {}).uri) // "?"):\(((.locations[0].physicalLocation.region // {}).startLine) // "?")` | `\(.ruleId // "?")` | \((((.message // {}).text) // "") | gsub("[\n\r]+"; " ") | gsub("[|]"; "\\|") | .[0:120]) |"' "$f" 2>/dev/null)
-              ch_total=$(jq '[.runs[]?.results[]? | select(((.level // "") | ascii_upcase) == "ERROR")] | length' "$f" 2>/dev/null || echo 0)
-              if [ -n "$ch_list" ]; then
-                echo ""
-                echo "**Critical/High findings:**"
-                echo ""
-                echo "| Location | Rule | Detail |"
-                echo "|---|---|---|"
-                echo "$ch_list"
-                if [ "${ch_total:-0}" -gt 10 ] 2>/dev/null; then
-                  echo "…and $((ch_total - 10)) more - the full list is in the \`report-iac\` artifact."
-                else
-                  echo ""
-                  echo "The full list (all severities) is in the \`report-iac\` artifact."
-                fi
-              else
-                echo ""
-                echo "_no Critical/High findings in this run - the full list (all severities) is in the \`report-iac\` artifact._"
-              fi
             else
               echo "❌ iac-checkov: fail"
               echo ""
@@ -772,6 +692,11 @@ jobs:
             echo ""
             echo "Job summary generated at run-time"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── SCA (reference parity): trivy fs on the dependency manifests -
+  #    requirements.txt + pyproject.toml (trivy's pip/python detection), dev
+  #    deps included.
+
 
 
   sca:
@@ -824,24 +749,6 @@ jobs:
               echo ""
               echo "Tool: trivy 0.76.0 (fs - dependency manifests)"
               echo "${ch} Critical/High of ${total} finding(s)"
-              ch_list=$(jq -r '[.runs[]?.results[]? | select(((.level // "") | ascii_upcase) | IN("CRITICAL","HIGH","ERROR"))] | .[:10][] | "| `\(((.locations[0].physicalLocation.artifactLocation // {}).uri) // "?"):\(((.locations[0].physicalLocation.region // {}).startLine) // "?")` | `\(.ruleId // "?")` | \((((.message // {}).text) // "") | gsub("[\n\r]+"; " ") | gsub("[|]"; "\\|") | .[0:120]) |"' "$f" 2>/dev/null)
-              if [ -n "$ch_list" ]; then
-                echo ""
-                echo "**Critical/High findings:**"
-                echo ""
-                echo "| Location | Rule | Detail |"
-                echo "|---|---|---|"
-                echo "$ch_list"
-                if [ "$ch" -gt 10 ] 2>/dev/null; then
-                  echo "…and $((ch - 10)) more - the full list is in the \`report-sca\` artifact."
-                else
-                  echo ""
-                  echo "The full list (all severities) is in the \`report-sca\` artifact."
-                fi
-              else
-                echo ""
-                echo "_no Critical/High findings in this run - the full list (all severities) is in the \`report-sca\` artifact._"
-              fi
             else
               echo "❌ sca-trivy-fs: fail"
               echo ""
@@ -853,6 +760,13 @@ jobs:
             echo ""
             echo "Job summary generated at run-time"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Unit tests: the app's bench suite (the Frappe test runner against a
+  #    real MariaDB + Redis - the same setup the repo's own ladder uses;
+  #    the framework pinned to the tag the product apps run, v15). ENABLED
+  #    in this app (the suite is green on main) - the junit report is a
+  #    required gate report; a red suite blocks the tag (fail-closed).
+
 
 
   unit-tests:
