@@ -508,10 +508,12 @@ jobs:
 
   # ── Hermes AI security review (hmis-style, single-delivery PULL mode):
   #    the repo-local hermes_review.py (checked out at the trusted base SHA)
-  #    fetches the PR diff via `gh pr diff`, HMAC-signs the event payload,
-  #    sends ONE webhook to the gateway, then polls for the PR comment.
-  #    Findings are advisory — only a technical failure (NOT COMPLETED /
-  #    timeout) fails the job. Runs on every pull request like the other
+  #    fetches the PR diff over the GitHub API, HMAC-signs the event payload,
+  #    sends ONE webhook to the gateway (a repeat for the same commit is
+  #    de-duplicated by the gateway), then polls for the PR comment and writes
+  #    verdict.json + hermes-findings.json + ai-review.sarif + hermes-report.md.
+  #    The job is advisory (continue-on-error): the verdict goes to the job
+  #    output and the G1 merge gate enforces it. Runs on every pull request like the other
   #    Develop controls (there is no push-mode variant: no PR, no review).
 
 
@@ -552,6 +554,13 @@ jobs:
 
       - name: Run Hermes AI Security Review
         id: verdict
+        # The script exits non-zero for a failing verdict (Critical/High, or a
+        # review that could not be rated), and always writes the verdict to the
+        # job output first. This job is advisory by design - the G1 merge gate
+        # enforces that output - so a failing verdict must not also turn the
+        # job red and read as a failed control in the PR findings comment.
+        # Anything unreadable (no output) still blocks: the gate is fail-closed.
+        continue-on-error: true
         env:
           HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
           HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
@@ -930,17 +939,22 @@ jobs:
           fi
           # 2) The AI security review verdict (the client writes
           #    pass/fail/error as the job OUTPUT before it exits - that is
-          #    authoritative): fail = Critical/High findings present
-          #    (blocking, per the merge-boundary policy); anything
-          #    unreadable blocks (fail-closed).
-          ai_result=$(jq -r '.["ai-security"].outputs.result // empty' <<<"$NEEDS")
+          #    authoritative): fail = Critical/High findings present, or a
+          #    review that could not be rated (blocking, per the merge-boundary
+          #    policy); anything unreadable blocks (fail-closed).
+          # hermes_review.py writes the job output as JSON {status, detail,
+          # metrics}; a bare pass/fail/error word (the previous client) is still
+          # read, and an empty output falls through to the fail-closed branch.
+          ai_raw=$(jq -r '.["ai-security"].outputs.result // empty' <<<"$NEEDS")
+          ai_result=$(printf '%s' "$ai_raw" | jq -Rr '. as $r | try (fromjson | .status) catch $r')
+          ai_detail=$(printf '%s' "$ai_raw" | jq -Rr 'try (fromjson | .detail // "") catch ""')
           case "$ai_result" in
             fail)
               counts="unknown"
               if [ -f reports/ai-review/verdict.json ]; then
                 counts=$(jq -r '"\(.blocking_findings) blocking (\(.severity_counts.Critical // 0) Critical, \(.severity_counts.High // 0) High)"' reports/ai-review/verdict.json)
               fi
-              echo "::error::G1 gate FAILED - AI security review reported $counts finding(s) - merge blocked (see the Hermes review comment + report-ai-review)"
+              echo "::error::G1 gate FAILED - AI security review: ${ai_detail:-$counts finding(s)} - merge blocked (see the Hermes review comment + report-ai-review)"
               exit 1
               ;;
             pass) ;;
@@ -1432,6 +1446,20 @@ jobs:
           merge-multiple: false
           path: reports
 
+      # dojo-import names a non-SARIF report's test after its directory, so the
+      # Hermes findings are staged under reports/ai-review/ to keep the test
+      # named "ai-review". hermes-findings.json is DefectDojo's Generic Findings
+      # Import (CWE, file/line, CVSS v4 vector, mitigation, impact, evidence);
+      # the SARIF stays in the artifact and in the PR comment / run summary.
+      - name: Stage the Hermes findings for the DefDojo import
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -s reports/report-ai-review/hermes-findings.json ]; then
+            mkdir -p reports/ai-review
+            cp reports/report-ai-review/hermes-findings.json reports/ai-review/hermes-findings.json
+          fi
+
       - name: Push all control reports to DefDojo (one reimport-scan per report)
         continue-on-error: true
         env:
@@ -1449,7 +1477,7 @@ jobs:
             reports/report-iac/checkov.sarif \
             reports/report-sca/trivy-fs.sarif \
             reports/report-image-scan/trivy.sarif \
-            reports/report-ai-review/ai-review.sarif
+            "Generic Findings Import=reports/ai-review/hermes-findings.json"
 
       - name: DefDojo summary (findings per control -> the run summary)
         if: always()
