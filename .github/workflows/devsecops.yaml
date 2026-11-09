@@ -16,11 +16,11 @@ name: devsecops pipeline
 # Differences vs the facility360 reference (frappe-gates-demo specifics):
 #   - Python/Frappe v15 app - the build is a docker buildx of the repo's
 #     OWN Dockerfile (single stage on the digest-pinned bench base image
-#     ghcr.io/usfali-ke/frappe-gates-demo-bench; COPY-only, reproducible)
+#     ghcr.io/tiberbu/frappe-gates-demo-bench; COPY-only, reproducible)
 #     - no Node/Next.js build, no kaniko, no build args.
 #   - release branch = main (this app releases from main; the deploy/**
 #     GitOps overlays track this repo's image).
-#   - registry = GHCR (ghcr.io/usfali-ke/frappe-gates-demo - the app's
+#   - registry = GHCR (ghcr.io/tiberbu/frappe-gates-demo - the app's
 #     established identity: the deploy overlays pin it, the repo's own
 #     ladder publishes there). NOT ECR: the image identity is the digest
 #     recorded from the registry at build time (docker buildx imagetools
@@ -97,9 +97,11 @@ permissions: {}
 env:
   GHCR_REGISTRY: ghcr.io
   # The app's established image identity (the deploy overlays pin
-  # ghcr.io/usfali-ke/frappe-gates-demo@sha256:... - the package lives in
-  # the usfali-ke GHCR namespace, same as the repo's own ladder publishes).
-  IMAGE_NAME: usfali-ke/frappe-gates-demo
+  # ghcr.io/tiberbu/frappe-gates-demo@sha256:... - the package lives in
+  # the tiberbu GHCR namespace, same as the repo's own ladder publishes;
+  # moved from usfali-ke on 2026-11-09 with the repo - a tiberbu repo's token
+  # can't write to another account's packages).
+  IMAGE_NAME: tiberbu/frappe-gates-demo
   # DefDojo (product "frappe-gates-demo" - the same product the repo's
   # defectdojo-upload workflow uploads to; the DD_API_TOKEN secret is the
   # dojo admin token - the release-engine fallback for setup writes, same

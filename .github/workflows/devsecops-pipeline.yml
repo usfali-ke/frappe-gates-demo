@@ -78,7 +78,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
-  IMAGE: ghcr.io/usfali-ke/frappe-gates-demo
+  IMAGE: ghcr.io/tiberbu/frappe-gates-demo
   IMAGE_TAG: frappe-gates-demo:ci
   BASE_IMAGE: python:3.11-slim@sha256:b95327ce1439e687237841b0210677aeadd62d55a060a5f6bcb9c15bf6251dd3
   SRC_DIRS: frappe_gates_demo
@@ -973,7 +973,7 @@ jobs:
       OUT: reports/publish
       VERDICT_FILE: reports/publish/verdict.json
       DIGEST: ${{ needs.build.outputs.digest }}
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.build.outputs.digest }}
+      REF: ghcr.io/tiberbu/frappe-gates-demo@${{ needs.build.outputs.digest }}
       PUBLISH: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
       # The keyless signature's identity is this file on main — what
       # Kyverno admits and devsecops-release.yml verifies.
@@ -1166,7 +1166,7 @@ jobs:
       id-token: write
     env:
       DIGEST: ${{ needs.build.outputs.digest }}
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.build.outputs.digest }}
+      REF: ghcr.io/tiberbu/frappe-gates-demo@${{ needs.build.outputs.digest }}
       PREDICATE_TYPE: https://github.com/${{ github.repository }}/evidence/v1
       CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
       # Controls that apply to this event; the rest aren't listed as missing.

@@ -129,7 +129,7 @@ on:
 permissions: {}
 
 env:
-  IMAGE: ghcr.io/usfali-ke/frappe-gates-demo
+  IMAGE: ghcr.io/tiberbu/frappe-gates-demo
   TARGET_ENV: ${{ inputs.environment }}
   KUSTOMIZATION: deploy/${{ inputs.environment }}/kustomization.yaml
   KIND: ${{ inputs.kind }}
@@ -288,7 +288,7 @@ jobs:
       CONTROL: provenance
       OUT: reports/provenance
       VERDICT_FILE: reports/provenance/verdict.json
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      REF: ghcr.io/tiberbu/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
       SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -356,7 +356,7 @@ jobs:
       CONTROL: evidence-check
       OUT: reports/evidence-check
       VERDICT_FILE: reports/evidence-check/verdict.json
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      REF: ghcr.io/tiberbu/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
       DIGEST: ${{ needs.resolve.outputs.digest }}
       SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
     steps:
@@ -499,7 +499,7 @@ jobs:
       CONTROL: previous-env-tests
       OUT: reports/previous-env-tests
       VERDICT_FILE: reports/previous-env-tests/verdict.json
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      REF: ghcr.io/tiberbu/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
       DIGEST: ${{ needs.resolve.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1696,7 +1696,7 @@ jobs:
       id-token: write
     env:
       DIGEST: ${{ needs.resolve.outputs.digest }}
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      REF: ghcr.io/tiberbu/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
       REPORT_PREFIX: report-${{ inputs.environment }}-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -1,7 +1,7 @@
 # Mirror the two dependency images into the org's registry.
 #
 # Why: the cluster's restrict-image-registries policy (G6) allows only
-# ghcr.io/usfali-ke/* inside product namespaces, and frappe-gates-demo needs a
+# the org's GHCR namespaces inside product namespaces, and frappe-gates-demo needs a
 # MariaDB and a Redis. Mirroring keeps the control intact instead of adding a
 # Docker Hub exception to it: after this runs, deploy/base/dependencies.yaml
 # points at these copies, digest-pinned like everything else.
@@ -39,7 +39,7 @@ env:
   # from registry 403 (Forbidden)" while copying into
   # .../frappe-gates-demo-deps). Mirroring into the package this repo already
   # publishes needs no new grant, and the tags say what they are.
-  DEST: ghcr.io/usfali-ke/frappe-gates-demo
+  DEST: ghcr.io/tiberbu/frappe-gates-demo
 
 jobs:
   mirror:

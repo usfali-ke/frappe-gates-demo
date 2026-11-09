@@ -19,7 +19,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/usfali-ke/frappe-gates-demo-bench
+  IMAGE: ghcr.io/tiberbu/frappe-gates-demo-bench
   FRAPPE_VERSION: v15.123.1
 
 jobs:
