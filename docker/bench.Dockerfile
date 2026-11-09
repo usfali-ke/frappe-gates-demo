@@ -9,7 +9,7 @@
 # reproducible by construction and takes seconds instead of minutes.
 #
 # Published by .github/workflows/bench-image.yaml to
-#   ghcr.io/usfali-ke/frappe-gates-demo-bench:v15-<FRAPPE_VERSION>
+#   docker.io/alienke/frappe-gates-demo-bench:v15-<FRAPPE_VERSION>
 # and referenced from the app Dockerfile BY DIGEST (never by tag).
 FROM python:3.11-slim@sha256:b95327ce1439e687237841b0210677aeadd62d55a060a5f6bcb9c15bf6251dd3
 

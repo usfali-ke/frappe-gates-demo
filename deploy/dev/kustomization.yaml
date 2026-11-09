@@ -25,5 +25,5 @@ images:
   # Never a tag: admission (Kyverno) requires digests. Every environment
   # starts at the digest prod already ran; promotion replaces it.
   - name: frappe-gates-demo
-    newName: ghcr.io/usfali-ke/frappe-gates-demo
+    newName: docker.io/alienke/frappe-gates-demo
     digest: sha256:d88e34ff5641481972642065229bdcf0253143ecaa3c4784ed2c3e17bd44caf4
