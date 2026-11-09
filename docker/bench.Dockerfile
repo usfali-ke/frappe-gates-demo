@@ -27,7 +27,11 @@ ENV PYTHONUNBUFFERED=1 \
 # library libgobject-2.0-0" — measured on the previous base image, so PDF
 # export was broken there, not by the dependency upgrade.
 # libglib2.0-0 is `libglib2.0-0t64` on Debian 13.
+# `apt-get upgrade` first: the pinned python:3.11-slim base ships whatever
+# Debian packages were current when it was built, and their security updates
+# since (2026-11-09: zlib1g, apt, linux-libc-dev) are only in the archive.
 RUN apt-get update -qq \
+ && apt-get upgrade -y -qq --no-install-recommends \
  && apt-get install -y -qq --no-install-recommends \
       ca-certificates curl git xz-utils gnupg build-essential libffi-dev pkg-config \
       cron procps mariadb-client \
@@ -86,20 +90,30 @@ RUN bench init \
 # and the app is exercised against them (migrate, API, notes page) rather than
 # assumed compatible. setuptools is bumped because it VENDORS jaraco.context
 # and wheel, and the vendored copies were the last two findings.
+# 2026-11-09: pypdf 6.21.2 -> 6.21.4 (14 findings) and msgpack 1.2.1 -> 1.2.3
+# (2), patch releases; oauthlib 3.3.1 -> 4.0.1 (2), past frappe's ~=3.3.1 pin.
+# oauthlib 4.0 removes JSONP token revocation and reorders device-code client
+# authentication; frappe uses neither (frappe/oauth.py, integrations/oauth2.py,
+# connected_app.py import Request, OAuth, FatalClientError, RequestValidator,
+# the pre-configured Server and BackendApplicationClient). Its one visible
+# change here: a token request missing grant_type now gets 400
+# invalid_request instead of 401 invalid_client. oauthlib is only in the
+# bench env, not the system interpreter.
 USER 10001:10001
 WORKDIR /home/frappe/frappe-bench
 RUN env/bin/pip install --no-cache-dir -q --no-deps --upgrade \
-      "GitPython==3.2.1" "PyJWT==2.15.1" "pillow==13.0.0" "pypdf==6.21.2" \
-      "urllib3==2.8.0" "filelock==4.2.1" "msgpack==1.2.1" "weasyprint==70.0" \
-      "setuptools==84.2.1" "wheel==0.46.3" "jaraco.context==6.1.0" "uv==0.13.4"
+      "GitPython==3.2.1" "PyJWT==2.15.1" "pillow==13.0.0" "pypdf==6.21.4" \
+      "urllib3==2.8.0" "filelock==4.2.1" "msgpack==1.2.3" "weasyprint==70.0" \
+      "setuptools==84.2.1" "wheel==0.46.3" "jaraco.context==6.1.0" "uv==0.13.4" \
+      "oauthlib==4.0.1"
 
 # The bench CLI itself lives in the system interpreter, so the same fixes are
 # applied there — trivy scans every Python environment in the image, and a fix
 # in one of them is not a fix.
 USER root
 RUN /usr/local/bin/pip install --no-cache-dir -q --no-deps --upgrade \
-      "GitPython==3.2.1" "PyJWT==2.15.1" "pillow==13.0.0" "pypdf==6.21.2" \
-      "urllib3==2.8.0" "filelock==4.2.1" "msgpack==1.2.1" "weasyprint==70.0" \
+      "GitPython==3.2.1" "PyJWT==2.15.1" "pillow==13.0.0" "pypdf==6.21.4" \
+      "urllib3==2.8.0" "filelock==4.2.1" "msgpack==1.2.3" "weasyprint==70.0" \
       "setuptools==84.2.1" "wheel==0.46.3" "jaraco.context==6.1.0" "uv==0.13.4" \
  && rm -rf /root/.cache/pip
 
