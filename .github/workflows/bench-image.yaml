@@ -5,7 +5,8 @@
 # app Dockerfile's FROM line, which is what makes the app image reproducible:
 # its only inputs are that pinned base and this repository's source.
 #
-# Needs no secrets: GHCR accepts the run's own GITHUB_TOKEN with packages: write.
+# Needs the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets (an alienke access
+# token with Read & Write): the image is published to docker.io/alienke.
 name: bench-image
 
 on:
@@ -19,7 +20,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/tiberbu/frappe-gates-demo-bench
+  IMAGE: docker.io/alienke/frappe-gates-demo-bench
   FRAPPE_VERSION: v15.123.1
 
 jobs:
@@ -34,9 +35,9 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: build
         run: |
           set -euo pipefail

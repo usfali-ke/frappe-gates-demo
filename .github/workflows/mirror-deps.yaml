@@ -1,7 +1,7 @@
 # Mirror the two dependency images into the org's registry.
 #
 # Why: the cluster's restrict-image-registries policy (G6) allows only
-# the org's GHCR namespaces inside product namespaces, and frappe-gates-demo needs a
+# the org's registries inside product namespaces, and frappe-gates-demo needs a
 # MariaDB and a Redis. Mirroring keeps the control intact instead of adding a
 # Docker Hub exception to it: after this runs, deploy/base/dependencies.yaml
 # points at these copies, digest-pinned like everything else.
@@ -34,21 +34,20 @@ env:
   # and the digest is what the manifests end up pinning.
   SOURCE_MARIADB: docker.io/library/mariadb@sha256:bb27bde261794d326398a9c998ddf9f35db45296d829123bff829cd076f68107
   SOURCE_REDIS: docker.io/library/redis@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
-  # A NEW package name is refused with 403 from GHCR's token endpoint even with
-  # packages: write (measured: "Requesting bearer token: invalid status code
-  # from registry 403 (Forbidden)" while copying into
-  # .../frappe-gates-demo-deps). Mirroring into the package this repo already
-  # publishes needs no new grant, and the tags say what they are.
-  DEST: ghcr.io/tiberbu/frappe-gates-demo
+  # Into the app's own repository, as tags: one repository to grant and to
+  # allow at admission, and the tags say what they are. (On GHCR a new package
+  # name was refused with 403 even with packages: write; Docker Hub since
+  # 2026-11-09, logging in with DOCKERHUB_USERNAME / DOCKERHUB_TOKEN.)
+  DEST: docker.io/alienke/frappe-gates-demo
 
 jobs:
   mirror:
-    name: Mirror MariaDB and Redis into GHCR
+    name: Mirror MariaDB and Redis into Docker Hub
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login docker.io -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
       # docker pull/tag/push, not skopeo: skopeo asks GHCR for a cross-repo blob
       # mount (library/mariadb -> this repo) and GHCR answers 403 on the token
@@ -79,8 +78,6 @@ jobs:
           cosign version
 
       - name: SBOM (syft) and SLSA v1 provenance for the mirrored digests
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/mirror"

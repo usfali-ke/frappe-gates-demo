@@ -57,7 +57,8 @@ on:
   # Re-enabled 2026-11-09. The triggers were off from 2026-11-04 while the
   # GHCR push failed with "The requested installation does not exist": the
   # repo had moved to the tiberbu org but still pushed to ghcr.io/usfali-ke,
-  # which its token can't write to. It now publishes to ghcr.io/tiberbu.
+  # which its token can't write to. It now publishes to docker.io/alienke
+  # (secrets DOCKERHUB_USERNAME / DOCKERHUB_TOKEN).
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   pull_request_review:
@@ -77,7 +78,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
-  IMAGE: ghcr.io/tiberbu/frappe-gates-demo
+  IMAGE: docker.io/alienke/frappe-gates-demo
   IMAGE_TAG: frappe-gates-demo:ci
   BASE_IMAGE: python:3.11-slim@sha256:b95327ce1439e687237841b0210677aeadd62d55a060a5f6bcb9c15bf6251dd3
   SRC_DIRS: frappe_gates_demo
@@ -508,7 +509,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      # The bench base image on ghcr.io is private; the build stage must pull it.
+      # The bench base image is on Docker Hub (docker.io/alienke); the login
+      # avoids the anonymous pull rate limit.
       packages: read
     outputs:
       digest: ${{ steps.repro.outputs.d1 }}
@@ -533,9 +535,9 @@ jobs:
       # The base image (docker/bench.Dockerfile) is a private ghcr package.
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: repro
         name: Build twice, compare digests
         # SOURCE_DATE_EPOCH = commit time, timestamps rewritten, no BuildKit
@@ -972,7 +974,7 @@ jobs:
       OUT: reports/publish
       VERDICT_FILE: reports/publish/verdict.json
       DIGEST: ${{ needs.build.outputs.digest }}
-      REF: ghcr.io/tiberbu/frappe-gates-demo@${{ needs.build.outputs.digest }}
+      REF: docker.io/alienke/frappe-gates-demo@${{ needs.build.outputs.digest }}
       PUBLISH: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
       # The keyless signature's identity is this file on main — what
       # Kyverno admits and devsecops-release.yml verifies.
@@ -1028,9 +1030,9 @@ jobs:
       - if: steps.ready.outputs.go == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - if: steps.ready.outputs.go == 'true'
         name: Push the tested bytes (digest preserved)
         run: |
@@ -1165,7 +1167,7 @@ jobs:
       id-token: write
     env:
       DIGEST: ${{ needs.build.outputs.digest }}
-      REF: ghcr.io/tiberbu/frappe-gates-demo@${{ needs.build.outputs.digest }}
+      REF: docker.io/alienke/frappe-gates-demo@${{ needs.build.outputs.digest }}
       PREDICATE_TYPE: https://github.com/${{ github.repository }}/evidence/v1
       CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
       # Controls that apply to this event; the rest aren't listed as missing.
@@ -1210,9 +1212,9 @@ jobs:
       - if: needs.publish.outputs.published == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - if: needs.publish.outputs.published == 'true'
         name: Attest the evidence manifest to the image digest
         run: |

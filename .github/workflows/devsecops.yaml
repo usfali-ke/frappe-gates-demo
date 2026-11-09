@@ -16,11 +16,11 @@ name: devsecops pipeline
 # Differences vs the facility360 reference (frappe-gates-demo specifics):
 #   - Python/Frappe v15 app - the build is a docker buildx of the repo's
 #     OWN Dockerfile (single stage on the digest-pinned bench base image
-#     ghcr.io/tiberbu/frappe-gates-demo-bench; COPY-only, reproducible)
+#     docker.io/alienke/frappe-gates-demo-bench; COPY-only, reproducible)
 #     - no Node/Next.js build, no kaniko, no build args.
 #   - release branch = main (this app releases from main; the deploy/**
 #     GitOps overlays track this repo's image).
-#   - registry = GHCR (ghcr.io/tiberbu/frappe-gates-demo - the app's
+#   - registry = GHCR (docker.io/alienke/frappe-gates-demo - the app's
 #     established identity: the deploy overlays pin it, the repo's own
 #     ladder publishes there). NOT ECR: the image identity is the digest
 #     recorded from the registry at build time (docker buildx imagetools
@@ -95,13 +95,13 @@ concurrency:
 permissions: {}
 
 env:
-  GHCR_REGISTRY: ghcr.io
+  REGISTRY: docker.io
   # The app's established image identity (the deploy overlays pin
-  # ghcr.io/tiberbu/frappe-gates-demo@sha256:... - the package lives in
-  # the tiberbu GHCR namespace, same as the repo's own ladder publishes;
-  # moved from usfali-ke on 2026-11-09 with the repo - a tiberbu repo's token
-  # can't write to another account's packages).
-  IMAGE_NAME: tiberbu/frappe-gates-demo
+  # docker.io/alienke/frappe-gates-demo@sha256:...; same as the repo's own
+  # ladder publishes). Docker Hub since 2026-11-09: the repo moved to the
+  # tiberbu org, whose token can't write to ghcr.io/usfali-ke. Pushes log in
+  # with the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets.
+  IMAGE_NAME: alienke/frappe-gates-demo
   # DefDojo (product "frappe-gates-demo" - the same product the repo's
   # defectdojo-upload workflow uploads to; the DD_API_TOKEN secret is the
   # dojo admin token - the release-engine fallback for setup writes, same
@@ -162,18 +162,18 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Login to GHCR (the app's package registry - GITHUB_TOKEN, packages scope)
+      - name: Login to Docker Hub (the app's registry - DOCKERHUB_USERNAME / DOCKERHUB_TOKEN)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push Docker image (amd64 only - the app's established identity)
         run: |
           set -euo pipefail
           docker buildx build --platform linux/amd64 \
-            -t "${GHCR_REGISTRY}/${IMAGE_NAME}:${{ needs.version.outputs.semVer }}" \
+            -t "${REGISTRY}/${IMAGE_NAME}:${{ needs.version.outputs.semVer }}" \
             --push .
 
       # ── The image identity (the reproducible-digest form): the DIGEST of
@@ -187,7 +187,7 @@ jobs:
           set -euo pipefail
           REPO="${IMAGE_NAME}"
           TAG="${{ needs.version.outputs.semVer }}"
-          REF="${GHCR_REGISTRY}/${REPO}:${TAG}"
+          REF="${REGISTRY}/${REPO}:${TAG}"
           J=$(docker buildx imagetools inspect "$REF") || {
             echo "::error::could not inspect $REF in the registry after the buildx push (fail-closed)"; exit 1; }
           DIGEST=$(jq -r '.Descriptor.digest // empty' <<<"$J")
@@ -202,9 +202,9 @@ jobs:
           # block scalar, and would silently swallow the rest of the step).
           IMAGE_DIGEST="$DIGEST" IMAGE_TAG="$TAG" \
           IMAGE_BRANCH="${GITHUB_REF_NAME}" \
-          IMAGE_SHA="${GITHUB_SHA}" GHCR_REGISTRY="$GHCR_REGISTRY" IMAGE_NAME="$IMAGE_NAME" python3 -c '
+          IMAGE_SHA="${GITHUB_SHA}" REGISTRY="$REGISTRY" IMAGE_NAME="$IMAGE_NAME" python3 -c '
           import json, os
-          image = "%s/%s:%s" % (os.environ["GHCR_REGISTRY"], os.environ["IMAGE_NAME"], os.environ["IMAGE_TAG"])
+          image = "%s/%s:%s" % (os.environ["REGISTRY"], os.environ["IMAGE_NAME"], os.environ["IMAGE_TAG"])
           identity = {
               "image": image,
               "digest": os.environ["IMAGE_DIGEST"],
@@ -973,7 +973,7 @@ jobs:
   #    (GitVersion is deterministic for the run's commit + tag set). ──────
 
   cosign:
-    name: Build · cosign sign (shared release key -> GHCR)
+    name: Build · cosign sign (shared release key -> Docker Hub)
     runs-on: ubuntu-latest
     # The COSIGN_KEY secret is the shared release key (the same
     # cosign-release-key the other apps sign with - one key, one verifier;
@@ -1002,17 +1002,17 @@ jobs:
             "https://x-access-token:${GIT_TOKEN}@github.com/tiberbu/devsecops-release-lib.git" "$LIB"
           test -f "$LIB/resources/devsecops-gh.sh" || exit 1
 
-      - name: Login to GHCR (registry auth for the signature push)
+      - name: Login to Docker Hub (registry auth for the signature push)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: cosign sign (shared lib, registry-agnostic)
         env:
           COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
-        run: bash "$LIB/resources/devsecops-gh.sh" cosign-sign "$GHCR_REGISTRY" "$IMAGE_NAME" "${{ needs.version.outputs.semVer }}"
+        run: bash "$LIB/resources/devsecops-gh.sh" cosign-sign "$REGISTRY" "$IMAGE_NAME" "${{ needs.version.outputs.semVer }}"
 
   image-scan:
     name: Build · image scan (trivy)
@@ -1032,12 +1032,12 @@ jobs:
           token: ${{ secrets.GIT_TOKEN }}
           fetch-depth: 1
 
-      - name: Login to GHCR (pull the built image)
+      - name: Login to Docker Hub (pull the built image)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # The shared lib's trivy-scan command is ECR-credentialed (aws ecr
       # get-login-password); for GHCR this job installs the SAME pinned
@@ -1056,11 +1056,11 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ needs.version.outputs.semVer }}"
-          docker pull "${GHCR_REGISTRY}/${IMAGE_NAME}:${TAG}"
+          docker pull "${REGISTRY}/${IMAGE_NAME}:${TAG}"
           mkdir -p image-scan
           /tmp/trivy-bin/trivy image --severity HIGH,CRITICAL \
             --format sarif --output image-scan/trivy.sarif \
-            "${GHCR_REGISTRY}/${IMAGE_NAME}:${TAG}"
+            "${REGISTRY}/${IMAGE_NAME}:${TAG}"
           [ -s image-scan/trivy.sarif ] || { echo "trivy produced no SARIF report (fail-closed)"; exit 1; }
 
       # Evidence: the control's report as an artifact (the reference shape).
@@ -1100,15 +1100,15 @@ jobs:
             echo "::error::devsecops-gh.sh not found at lib ref '$LIB_REF' - the shared library must be deployed; dispatch with lib_ref=<branch> or merge the lib PR first"
             exit 1; }
 
-      - name: Login to GHCR (registry pull for the CIS scan)
+      - name: Login to Docker Hub (registry pull for the CIS scan)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: dockle CIS scan (shared lib, pinned dockle; scanned, not dojo-published - Jenkins parity)
-        run: bash "$LIB/resources/devsecops-gh.sh" dockle-scan "$GHCR_REGISTRY" "$IMAGE_NAME" "${{ needs.version.outputs.semVer }}" dockle/dockle.json
+        run: bash "$LIB/resources/devsecops-gh.sh" dockle-scan "$REGISTRY" "$IMAGE_NAME" "${{ needs.version.outputs.semVer }}" dockle/dockle.json
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -1146,15 +1146,15 @@ jobs:
             echo "::error::devsecops-gh.sh not found at lib ref '$LIB_REF' - the shared library must be deployed; dispatch with lib_ref=<branch> or merge the lib PR first"
             exit 1; }
 
-      - name: Login to GHCR (registry source for the SBOM)
+      - name: Login to Docker Hub (registry source for the SBOM)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: syft SBOM (shared lib, pinned syft; scanned, not dojo-published - Jenkins parity)
-        run: bash "$LIB/resources/devsecops-gh.sh" syft-scan "$GHCR_REGISTRY" "$IMAGE_NAME" "${{ needs.version.outputs.semVer }}" sbom/sbom.cdx.json
+        run: bash "$LIB/resources/devsecops-gh.sh" syft-scan "$REGISTRY" "$IMAGE_NAME" "${{ needs.version.outputs.semVer }}" sbom/sbom.cdx.json
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -1317,19 +1317,19 @@ jobs:
             echo "::error::devsecops-gh.sh not found at lib ref '$LIB_REF' - the shared library must be deployed; dispatch with lib_ref=<branch> or merge the lib PR first"
             exit 1; }
 
-      - name: Login to GHCR (registry access for the identity re-check)
+      - name: Login to Docker Hub (registry access for the identity re-check)
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Verify the image identity in the registry (present + digest unchanged since the build - before tagging)
         run: |
           set -euo pipefail
           REPO="${IMAGE_NAME}"
           TAG="${{ needs.version.outputs.semVer }}"
-          REF="${GHCR_REGISTRY}/${REPO}:${TAG}"
+          REF="${REGISTRY}/${REPO}:${TAG}"
           J=$(docker buildx imagetools inspect "$REF" 2>/dev/null) || {
             echo "::error::image not found in the registry: $REF - NO tag (fail-closed)"
             exit 1; }
@@ -1374,8 +1374,8 @@ jobs:
           {
             echo "## main release ${{ needs.version.outputs.semVer }}"
             echo ""
-            echo "- **Registry:** GHCR (\`${{ env.GHCR_REGISTRY }}\`) - the app's established identity (the deploy overlays pin it)"
-            echo "- **Image:** \`${{ env.GHCR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.semVer }}\`"
+            echo "- **Registry:** GHCR (\`${{ env.REGISTRY }}\`) - the app's established identity (the deploy overlays pin it)"
+            echo "- **Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.semVer }}\`"
             echo "- **Identity:** digest \`${{ needs.build.outputs.digest }}\` (recorded at build; the tag re-verified against this digest before tagging)"
             echo "- **Build:** in-workflow docker buildx (the repo's own Dockerfile, Frappe v15 bench app, amd64 only)"
             echo "- **Version flow:** GitVersion (the repo's GitVersion.yml - tag prefix \`${{ needs.version.outputs.tagName }}\`); the image verified in the registry before the tag"

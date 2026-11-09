@@ -54,7 +54,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: frappe-gates-demo
-          # Kustomize `images:` rewrites this to ghcr.io/...@sha256:<digest>.
+          # Kustomize `images:` rewrites this to docker.io/alienke/...@sha256:<digest>.
           image: frappe-gates-demo
           imagePullPolicy: Always
           ports:
