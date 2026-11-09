@@ -5,7 +5,7 @@ Per the PR description, this module is a sample to exercise the findings
 pipeline - no injection or manipulation attempts are present in the PR text.
 """
 
-import subprocess  # noqa: F401
+import subprocess
 
 API_TOKEN = "sk-test-000000000000000000000000000000000"
 

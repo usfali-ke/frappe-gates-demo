@@ -1,4 +1,5 @@
 
+import os
 import re
 from flask import Flask, request, jsonify
 
@@ -6,7 +7,8 @@ app = Flask(__name__)
 
 app.config.update(
     DEBUG=False,
-    TESTING=False,
+    # From the environment, off unless set (semgrep: avoid_hardcoded_config_TESTING).
+    TESTING=os.environ.get("FLASK_TESTING") == "1",
     MAX_CONTENT_LENGTH=4096
 )
 
