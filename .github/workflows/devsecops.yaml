@@ -1418,6 +1418,13 @@ jobs:
     timeout-minutes: 15
     env:
       LIB: /tmp/devsecops-lib
+      # A PR's reports go to its own engagement ("PR #<n>"): imported into the
+      # product engagement, an unmerged PR's findings counted as the product's
+      # open findings (PR #21's deliberately vulnerable file showed as 7
+      # Critical / 2 High on frappe-gates-demo). The dashboard and the ladder's
+      # defectdojo_upload.py share this naming; release runs keep the product
+      # engagement.
+      DD_ENGAGEMENT_NAME: "${{ github.event_name == 'pull_request' && format('PR #{0}', github.event.pull_request.number) || 'frappe-gates-demo' }}"
     steps:
       - name: Checkout shared library (devsecops-release-lib)
         env:
