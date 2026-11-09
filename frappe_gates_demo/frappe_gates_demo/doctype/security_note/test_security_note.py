@@ -42,6 +42,10 @@ class TestSecurityNote(FrappeTestCase):
 		with self.assertRaises(frappe.ValidationError):
 			self._make(title="a" * (MIN_TITLE - 1))
 
+	def test_long_title_is_rejected(self):
+		with self.assertRaises(frappe.ValidationError):
+			self._make(title="a" * 141)
+
 	def test_unknown_severity_is_rejected(self):
 		with self.assertRaises(frappe.ValidationError):
 			self._make(title="Bad severity", severity="Apocalyptic")
