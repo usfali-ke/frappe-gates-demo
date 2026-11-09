@@ -42,13 +42,21 @@ jobs:
       SRC: ghcr.io/usfali-ke
       DST: ghcr.io/tiberbu
       REPOS: frappe-gates-demo-bench frappe-gates-demo
-      # Must resolve in DST afterwards (repo@digest) - the pins in this repo.
+      # Digests to copy even though no tag points at them any more: what
+      # dev / staging / prod run on kind today (2026-11-09) is an untagged
+      # manifest in the old repository, which a copy by tag misses.
+      UNTAGGED: >-
+        frappe-gates-demo@sha256:fb1d4c2a1afc566b1ef8859cb32029e09309d51112b4446a98efe79428f66f1a
+      # Must resolve in DST afterwards (repo@digest): the pins in this repo
+      # and the running digest. (staging / prod's overlay pin,
+      # sha256:72288e24..., is not here: it doesn't exist in the old
+      # repository either, so there is nothing to copy - see the PR.)
       PINNED: >-
         frappe-gates-demo-bench@sha256:eda3717eabb2dbd934a8d27996e0937810468e3e0c632d74d0a6660b6161e33f
         frappe-gates-demo@sha256:bb27bde261794d326398a9c998ddf9f35db45296d829123bff829cd076f68107
         frappe-gates-demo@sha256:8be847644e195abc4c10c8d9936cfa45332eccc6b714fa7b186ff43f1f4d5579
         frappe-gates-demo@sha256:d88e34ff5641481972642065229bdcf0253143ecaa3c4784ed2c3e17bd44caf4
-        frappe-gates-demo@sha256:72288e24c054855fbb6da2fe41332a6ec6f6b740365203b614130b70e67b31e7
+        frappe-gates-demo@sha256:fb1d4c2a1afc566b1ef8859cb32029e09309d51112b4446a98efe79428f66f1a
     steps:
       - name: Install crane (pinned, checksum-verified)
         run: |
@@ -65,7 +73,7 @@ jobs:
           ACTOR: ${{ github.actor }}
         run: echo "$GH_TOKEN" | crane auth login ghcr.io -u "$ACTOR" --password-stdin
 
-      - name: Copy every tag
+      - name: Copy every tag, and the untagged digests still in use
         run: |
           set -euo pipefail
           copied=0 skipped=0
@@ -79,7 +87,12 @@ jobs:
               copied=$((copied + 1))
             done
           done
-          echo "copied $copied tag(s), $skipped already present"
+          for ref in $UNTAGGED; do
+            if crane manifest "$DST/$ref" >/dev/null 2>&1; then skipped=$((skipped + 1)); continue; fi
+            crane copy "$SRC/$ref" "$DST/$ref"
+            copied=$((copied + 1))
+          done
+          echo "copied $copied tag(s) / digest(s), $skipped already present"
           echo "Copied **$copied** tag(s) from \`$SRC\` to \`$DST\`; **$skipped** were already there." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify every pinned digest resolves in the new namespace
