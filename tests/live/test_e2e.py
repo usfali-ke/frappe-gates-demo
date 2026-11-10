@@ -43,7 +43,12 @@ def test_the_page_shows_the_session_user_and_the_tally(a):
 	page = _page(a)
 	who = data(get(a, "whoami"))
 	assert who["full_name"].split()[0] in page
-	assert "open of" in page
+	# The tally as notes.html words it since PR #16 ("Update header text"):
+	# "<open> of <total> notes open". Checked against the API's own counts for
+	# the same session, so the page is shown to agree with the data, not just
+	# to contain a phrase.
+	tally = stats(a)
+	assert f"{tally['open']} of {tally['total']} notes open" in page, "the page's tally disagrees with notes_stats"
 
 
 def test_the_api_and_the_page_agree_on_the_list(a):
