@@ -3,6 +3,8 @@
 Run with: bench --site <site> run-tests --app frappe_gates_demo
 """
 
+from unittest.mock import patch
+
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
@@ -24,6 +26,12 @@ class TestApi(FrappeTestCase):
 		self.assertEqual(payload["app_version"], __version__)
 		self.assertTrue(payload["db"])
 		self.assertIn("frappe_version", payload)
+
+	def test_health_reports_degraded_when_the_database_fails(self):
+		with patch.object(frappe.db, "sql", side_effect=Exception("database down")):
+			payload = api.health()
+		self.assertEqual(payload["status"], "degraded")
+		self.assertFalse(payload["db"])
 
 	def test_health_leaks_no_site_paths_or_users(self):
 		payload = api.health()
@@ -70,6 +78,24 @@ class TestApi(FrappeTestCase):
 	def test_notes_list_rejects_an_unknown_severity(self):
 		with self.assertRaises(frappe.ValidationError):
 			api.notes_list(severity="Nope")
+
+	def test_notes_list_rejects_an_unknown_status(self):
+		with self.assertRaises(frappe.ValidationError):
+			api.notes_list(status="Pending")
+
+	def test_notes_list_filters_by_status(self):
+		closed = api.note_create(title="Filter: closed note")
+		api.note_create(title="Filter: open note")
+		api.note_close(name=closed["name"])
+		rows = api.notes_list(status="Closed", limit=100)
+		self.assertIn(closed["name"], [row["name"] for row in rows])
+		self.assertTrue(all(row["status"] == "Closed" for row in rows))
+
+	def test_notes_list_search_matches_the_title(self):
+		wanted = api.note_create(title="Searchable zebra note")
+		api.note_create(title="Something else entirely")
+		rows = api.notes_list(search="zebra", limit=100)
+		self.assertEqual([row["name"] for row in rows], [wanted["name"]])
 
 	def test_notes_list_clamps_the_limit(self):
 		self.assertLessEqual(len(api.notes_list(limit=100000)), api.MAX_LIST_LIMIT)

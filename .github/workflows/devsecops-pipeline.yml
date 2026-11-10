@@ -54,6 +54,11 @@
 name: devsecops-pipeline
 
 on:
+  # Re-enabled 2026-11-09. The triggers were off from 2026-11-04 while the
+  # GHCR push failed with "The requested installation does not exist": the
+  # repo had moved to the tiberbu org but still pushed to ghcr.io/usfali-ke,
+  # which its token can't write to. It now publishes to docker.io/alienke
+  # (secrets DOCKERHUB_USERNAME / DOCKERHUB_TOKEN).
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   pull_request_review:
@@ -73,7 +78,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
-  IMAGE: ghcr.io/usfali-ke/frappe-gates-demo
+  IMAGE: docker.io/alienke/frappe-gates-demo
   IMAGE_TAG: frappe-gates-demo:ci
   BASE_IMAGE: python:3.11-slim@sha256:b95327ce1439e687237841b0210677aeadd62d55a060a5f6bcb9c15bf6251dd3
   SRC_DIRS: frappe_gates_demo
@@ -417,49 +422,131 @@ jobs:
           path: reports/reviewers/
           if-no-files-found: ignore
 
-  # ai-review:
-  #   name: Develop · AI security review · Hermes
-  #   if: startsWith(github.event_name, 'pull_request') && github.event.pull_request.head.repo.full_name == github.repository
-  #   # The Hermes gateway is the LAB one (192.168.122.191:8644, kali-vm on the
-  #   # libvirt bridge), which is reachable from the host runners and not from an
-  #   # in-cluster ARC pod: the sender must run where the route is routable.
-  #   runs-on: [self-hosted, linux, frappe-gates-demo-env]
-  #   timeout-minutes: 30
-  #   permissions:
-  #     contents: read
-  #     pull-requests: read
-  #     issues: read
-  #   outputs:
-  #     result: ${{ steps.verdict.outputs.result }}
-  #   env:
-  #     CONTROL: ai-review
-  #     OUT: reports/ai-review
-  #     VERDICT_FILE: reports/ai-review/verdict.json
-  #   steps:
-  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-  #       with:
-  #         persist-credentials: false
-  #         sparse-checkout: .github/scripts
-  #     - id: verdict
-  #       env:
-  #         HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL || 'http://192.168.122.191:8644/webhooks/github-pr-review' }}
-  #         HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
-  #         HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
-  #         GH_TOKEN: ${{ github.token }}
-  #         PR_NUMBER: ${{ github.event.pull_request.number }}
-  #         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-  #         WAIT_SECONDS: "1500"
-  #       run: python3 .github/scripts/hermes_review.py
-  #     # Supplementary evidence only — the verdict reaches gate-g1 through the
-  #     # job output. lab-runner's egress to GitHub's artifact storage is
-  #     # flaky (ETIMEDOUT), and that must not turn a passing review red.
-  #     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-  #       if: always()
-  #       continue-on-error: true
-  #       with:
-  #         name: report-ai-review
-  #         path: reports/ai-review/
-  #         if-no-files-found: ignore
+  # ── Hermes AI security review (PR only). Moved here from devsecops.yaml
+  #    when that workflow was retired (2026-11-09) - unchanged. Advisory:
+  #    its findings never block a merge, so it is not a G1 input. It reviews
+  #    with the tooling from the PR's BASE commit, so a PR can't change the
+  #    review that judges it.
+
+  ai-security:
+    name: Develop · AI security review (Hermes, PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      OUT: reports/ai-review
+      VERDICT_FILE: reports/ai-review/verdict.json
+    steps:
+      - name: Checkout trusted review tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify Hermes configuration
+        env:
+          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
+          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          [ -n "$HERMES_URL" ] || { echo "::error::HERMES_WEBHOOK_URL not configured"; exit 1; }
+          [ -n "$HERMES_SECRET" ] || { echo "::error::HERMES_WEBHOOK_SECRET not configured"; exit 1; }
+          python3 --version
+          gh --version
+          test -f .github/scripts/hermes_review.py
+
+      - name: Run Hermes AI Security Review
+        id: verdict
+        # The script exits non-zero for a failing verdict (Critical/High, or a
+        # review that could not be rated), and always writes the verdict to the
+        # job output first. This job is advisory by design - the G1 merge gate
+        # enforces that output - so a failing verdict must not also turn the
+        # job red and read as a failed control in the PR findings comment.
+        # Anything unreadable (no output) still blocks: the gate is fail-closed.
+        continue-on-error: true
+        env:
+          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
+          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+          HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WAIT_SECONDS: "1500"
+          MAX_DIFF_BYTES: "450000"
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          python3 .github/scripts/hermes_review.py
+
+      - name: Upload AI Review Report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: report-ai-review
+          path: reports/ai-review/
+          if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -uo pipefail
+          f=reports/ai-review/verdict.json
+          {
+            echo "## Develop · AI security review (Hermes, PR) summary"
+            echo ""
+            if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
+              result=$(jq -r '.result // "unknown"' "$f")
+              case "$result" in
+                pass)
+                  echo "✅ ai-review: pass"
+                  echo ""
+                  echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
+                  echo "0 blocking finding(s) - review clean (advisory control)"
+                  ;;
+                fail)
+                  blk=$(jq -r '.blocking_findings // 0' "$f")
+                  crit=$(jq -r '.severity_counts.Critical // 0' "$f")
+                  high=$(jq -r '.severity_counts.High // 0' "$f")
+                  echo "❌ ai-review: fail (advisory job - the G1 merge gate enforces it)"
+                  echo ""
+                  echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
+                  echo "${blk} blocking finding(s): ${crit} Critical, ${high} High"
+                  ;;
+                *)
+                  echo "❌ ai-review: fail"
+                  echo ""
+                  echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
+                  echo "review not completed (status: $(jq -r '.status // "?"' "$f")) - fail-closed"
+                  ;;
+              esac
+              url=$(jq -r '.comment_url // ""' "$f")
+              if [ -n "$url" ]; then
+                echo ""
+                echo "[Hermes review comment](${url})"
+              fi
+            else
+              echo "❌ ai-review: fail"
+              echo ""
+              echo "no verdict - the job failed before the review completed (fail-closed)"
+            fi
+            echo ""
+            echo "The tool's own report is in the job log above and in the \`report-ai-review\` artifact."
+            echo ""
+            echo "Job summary generated at run-time"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── IaC: checkov on the repo's own Dockerfile (the Dockerfile is in the
+  #    checkout, so this control runs on PR runs too, and the report is a
+  #    PR-required report).
 
   commits-signed:
     name: Develop · governance · signed commits
@@ -509,10 +596,8 @@ jobs:
 
   gate-g1:
     name: G1 merge gate (Develop → Build)
-    # ai-review is deliberately not listed: its job is commented out above, and
-    # a `needs` naming a job that does not exist makes the whole workflow
-    # invalid (GitHub then runs nothing at all). The criterion is recorded as
-    # skipped-with-reason by gate.py, not silently passed.
+    # ai-security (Hermes, above) is advisory — findings never
+    # block a merge — so it is not a gate input here.
     needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed]
     if: always() && startsWith(github.event_name, 'pull_request')
     runs-on: ubuntu-latest
@@ -548,7 +633,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      # The bench base image on ghcr.io is private; the build stage must pull it.
+      # The bench base image is on Docker Hub (docker.io/alienke); the login
+      # avoids the anonymous pull rate limit.
       packages: read
     outputs:
       digest: ${{ steps.repro.outputs.d1 }}
@@ -573,9 +659,9 @@ jobs:
       # The base image (docker/bench.Dockerfile) is a private ghcr package.
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: repro
         name: Build twice, compare digests
         # SOURCE_DATE_EPOCH = commit time, timestamps rewritten, no BuildKit
@@ -1012,7 +1098,7 @@ jobs:
       OUT: reports/publish
       VERDICT_FILE: reports/publish/verdict.json
       DIGEST: ${{ needs.build.outputs.digest }}
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.build.outputs.digest }}
+      REF: docker.io/alienke/frappe-gates-demo@${{ needs.build.outputs.digest }}
       PUBLISH: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
       # The keyless signature's identity is this file on main — what
       # Kyverno admits and devsecops-release.yml verifies.
@@ -1068,9 +1154,9 @@ jobs:
       - if: steps.ready.outputs.go == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - if: steps.ready.outputs.go == 'true'
         name: Push the tested bytes (digest preserved)
         run: |
@@ -1205,7 +1291,7 @@ jobs:
       id-token: write
     env:
       DIGEST: ${{ needs.build.outputs.digest }}
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.build.outputs.digest }}
+      REF: docker.io/alienke/frappe-gates-demo@${{ needs.build.outputs.digest }}
       PREDICATE_TYPE: https://github.com/${{ github.repository }}/evidence/v1
       CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/devsecops-pipeline.yml@refs/heads/main
       # Controls that apply to this event; the rest aren't listed as missing.
@@ -1250,9 +1336,9 @@ jobs:
       - if: needs.publish.outputs.published == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - if: needs.publish.outputs.published == 'true'
         name: Attest the evidence manifest to the image digest
         run: |

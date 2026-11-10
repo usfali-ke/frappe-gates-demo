@@ -1,0 +1,40 @@
+mode: ContinuousDeployment
+
+# Branch versioning strategy:
+# Feature → Develop → Main
+#
+# Version flow example:
+# - Feature: 1.2.0-feature-name.1
+# - Develop: 1.2.0-dev.1 (development builds)
+# - Main: 1.2.0 (production release)
+
+branches:
+  develop:
+    mode: ContinuousDeployment
+    tag: dev
+    increment: Minor
+    track-merge-target: true
+    regex: ^dev(elop)?(ment)?$
+    is-release-branch: false
+  main:
+    mode: ContinuousDelivery
+    tag: ''
+    increment: Patch
+    track-merge-target: false
+    regex: ^master$|^main$
+    source-branches: ['develop']
+    is-release-branch: true
+  feature:
+    mode: ContinuousDeployment
+    tag: useBranchName
+    increment: Inherit
+    track-merge-target: false
+    regex: ^feat(ure)?[/-]
+    source-branches: ['develop']
+ignore:
+  sha: []
+major-version-bump-message: "^(breaking|major)(\\(.+\\))?(!|:)"
+minor-version-bump-message: "^(feat|feature)(\\(.+\\))?(!|:)"
+patch-version-bump-message: "^(fix|bugfix|patch)(\\(.+\\))?(!|:)"
+no-bump-message: '\+semver:\s?(none|skip)'
+tag-prefix: 'frappe-gates-demo-'

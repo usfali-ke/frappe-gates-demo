@@ -93,6 +93,8 @@ jobs:
       # available inside it unless they are passed here. The deploy job
       # reads exactly this one (the ruleset bypass for its push to main).
       GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     with:
       environment: dev
       kind: ${{ inputs.kind }}
@@ -121,6 +123,8 @@ jobs:
       # available inside it unless they are passed here. The deploy job
       # reads exactly this one (the ruleset bypass for its push to main).
       GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     with:
       environment: staging
       kind: ${{ inputs.kind }}
@@ -147,6 +151,8 @@ jobs:
       # available inside it unless they are passed here. The deploy job
       # reads exactly this one (the ruleset bypass for its push to main).
       GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     with:
       environment: prod
       kind: ${{ inputs.kind }}

@@ -118,6 +118,12 @@ on:
       GITOPS_DEPLOY_KEY:
         description: Write deploy key whose public half is the ruleset's bypass actor (repo secret).
         required: true
+      DOCKERHUB_USERNAME:
+        description: Docker Hub account the app's images live under (alienke).
+        required: true
+      DOCKERHUB_TOKEN:
+        description: Docker Hub access token for that account (Read & Write) - the registry logins and trivy's image pull.
+        required: true
     outputs:
       digest:
         value: ${{ jobs.resolve.outputs.digest }}
@@ -129,7 +135,7 @@ on:
 permissions: {}
 
 env:
-  IMAGE: ghcr.io/usfali-ke/frappe-gates-demo
+  IMAGE: docker.io/alienke/frappe-gates-demo
   TARGET_ENV: ${{ inputs.environment }}
   KUSTOMIZATION: deploy/${{ inputs.environment }}/kustomization.yaml
   KIND: ${{ inputs.kind }}
@@ -200,9 +206,9 @@ jobs:
           fetch-depth: 0
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: digest
         env:
           GH_TOKEN: ${{ github.token }}
@@ -300,7 +306,7 @@ jobs:
       CONTROL: provenance
       OUT: reports/provenance
       VERDICT_FILE: reports/provenance/verdict.json
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      REF: docker.io/alienke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
       SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -312,9 +318,9 @@ jobs:
           cosign-release: v2.6.5
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: check
         env:
           GH_TOKEN: ${{ github.token }}
@@ -368,7 +374,7 @@ jobs:
       CONTROL: evidence-check
       OUT: reports/evidence-check
       VERDICT_FILE: reports/evidence-check/verdict.json
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      REF: docker.io/alienke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
       DIGEST: ${{ needs.resolve.outputs.digest }}
       SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
     steps:
@@ -381,9 +387,9 @@ jobs:
           cosign-release: v2.6.5
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: check
         # The signed manifest is the pipeline's own record of this digest:
         # built from its source commit, every control passed, the Control
@@ -520,7 +526,7 @@ jobs:
       CONTROL: previous-env-tests
       OUT: reports/previous-env-tests
       VERDICT_FILE: reports/previous-env-tests/verdict.json
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      REF: docker.io/alienke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
       DIGEST: ${{ needs.resolve.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -532,9 +538,9 @@ jobs:
           cosign-release: v2.6.5
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: check
         run: |
           set -uo pipefail
@@ -708,9 +714,9 @@ jobs:
           cosign-release: v2.6.5
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - id: check
         run: |
           set -uo pipefail
@@ -1611,8 +1617,8 @@ jobs:
           persist-credentials: false
       - name: trivy image (current vulnerability DB)
         env:
-          TRIVY_USERNAME: ${{ github.actor }}
-          TRIVY_PASSWORD: ${{ github.token }}
+          TRIVY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          TRIVY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           mkdir -p "$OUT/dependency-check" && chmod 777 "$OUT/dependency-check"
           docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
@@ -1749,7 +1755,7 @@ jobs:
       id-token: write
     env:
       DIGEST: ${{ needs.resolve.outputs.digest }}
-      REF: ghcr.io/usfali-ke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
+      REF: docker.io/alienke/frappe-gates-demo@${{ needs.resolve.outputs.digest }}
       REPORT_PREFIX: report-${{ inputs.environment }}-
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1793,9 +1799,9 @@ jobs:
       - if: needs.deploy.result == 'success'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - if: needs.deploy.result == 'success'
         name: Attest the release record to the image digest
         run: |
