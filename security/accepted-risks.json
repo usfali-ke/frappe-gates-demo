@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "Accepted risks, read by .github/scripts/verdict.py accepted(): an entry",
+    "matches a finding by control + id (+ optional `match` substring), never",
+    "expires silently (the date is checked) and is recorded in the verdict",
+    "detail and the findings table so it stays visible.",
+    "Every entry here is about the TEST HARNESS, not about the app: the",
+    "environment stand-in ingress is a Caddy container with a locally generated",
+    "CA (tests/env/Caddyfile), because the test runner has to reach the pod from",
+    "outside the cluster over TLS. The production path uses the cluster ingress",
+    "certificate."
+  ],
+  "accepted": [
+    {
+      "control": "dast-tls",
+      "id": "cert_revocation",
+      "reason": "The harness CA publishes no OCSP or CRL endpoints, so revocation status cannot be evaluated at all. A public certificate served by a real ingress is checked by the browser and by the dashboard's own probe; nothing about this deployment is learned by failing it here.",
+      "expires": "2027-01-31"
+    },
+    {
+      "control": "dast-tls",
+      "id": "intermediate_cert_expiration",
+      "reason": "Caddy's internal intermediate CA is short-lived and rotated by Caddy itself on restart. Its expiry is a property of the ephemeral harness CA, not of the service certificate under test.",
+      "expires": "2027-01-31"
+    },
+    {
+      "control": "dast-tls",
+      "id": "intermediate_cert_notAfter",
+      "reason": "Same internal intermediate CA: notAfter is regenerated with the CA on every harness start.",
+      "expires": "2027-01-31"
+    }
+  ]
+}

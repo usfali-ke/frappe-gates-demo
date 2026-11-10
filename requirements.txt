@@ -3,3 +3,12 @@
 # Frappe itself is installed by bench, not by pip here; this file is the
 # declared dependency set of the app, which is exactly what SCA should read.
 frappe==15.123.1
+
+# Deliberate end-to-end fixture for the exploit-intelligence path: this pin is
+# never installed (bench builds the image from its own environment), so it
+# cannot affect the running app — it exists so the SCA gate flags a CVE with
+# public exploitation evidence and the dashboard's intel can be checked against
+# real data (CVE-2023-4863, libwebp via Pillow: CISA KEV, SSVC active, EPSS
+# ~0.9998; plus CVE-2023-50447, arbitrary code execution, fixed in 10.2.0).
+# Revert by deleting this line; it is not a runtime dependency.
+pillow==9.5.0

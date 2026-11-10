@@ -25,4 +25,4 @@ images:
   # starts at the digest prod already ran; promotion replaces it.
   - name: frappe-gates-demo
     newName: docker.io/alienke/frappe-gates-demo
-    digest: sha256:72288e24c054855fbb6da2fe41332a6ec6f6b740365203b614130b70e67b31e7
+    digest: sha256:fb1d4c2a1afc566b1ef8859cb32029e09309d51112b4446a98efe79428f66f1a

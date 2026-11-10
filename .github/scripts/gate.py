@@ -189,7 +189,17 @@ def main():
         if reason:
             c["status"] = "skipped"
             c["detail"] = reason
-    ok = all(c["status"] == "pass" or (c["status"] == "skipped" and c["key"] in allow_skipped) for c in criteria)
+    # A FIRST release into an environment that has never served has no digest to
+    # return to: prod's overlay may pin a bootstrap image that was never signed
+    # and whose pods never became Ready. The rollback control says so as
+    # `skipped` ("first release: ..."), and that reason is the only thing that
+    # may skip this criterion in prod — a serving environment with an
+    # unverifiable previous image still fails.
+    first_release = {c["key"] for c in criteria
+                     if c["status"] == "skipped" and (c.get("detail") or "").startswith("first release: ")}
+    ok = all(c["status"] == "pass"
+             or (c["status"] == "skipped" and (c["key"] in allow_skipped or c["key"] in first_release))
+             for c in criteria)
     status = "pass" if ok else "fail"
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     body = {

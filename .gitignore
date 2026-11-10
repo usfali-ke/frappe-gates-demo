@@ -3,7 +3,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-env/
+# A bench/pip virtualenv at the repo root — NOT any directory called env:
+# `env/` also swallowed tests/env/, so the stage pipeline's harness was never
+# committed and every test job died with
+# "bash: tests/env/env-up.sh: No such file or directory" (exit 127).
+/env/
+!tests/env/
 
 # Test / analysis artifacts (the pipeline writes these into the workspace)
 reports/

@@ -26,7 +26,12 @@ spec:
       initialDelay: 40s
       failureLimit: 0
       consecutiveErrorLimit: 3
-      successCondition: result.status == 'ok'
+      # Frappe wraps every /api/method response in `message`, so the health
+      # body is {"message": {"status": "ok", ...}}. The django-style
+      # `result.status` reads null here, the condition is false on the first
+      # sample and failureLimit 0 aborts the rollout — which is exactly how dev
+      # failed: "Metric functional assessed Failed due to failed (1) > failureLimit (0)".
+      successCondition: result.message.status == 'ok'
       provider:
         web:
           url: http://frappe-gates-demo-canary.NAMESPACE.svc/api/method/frappe_gates_demo.api.health
