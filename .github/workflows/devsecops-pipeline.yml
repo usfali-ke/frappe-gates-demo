@@ -470,7 +470,8 @@ jobs:
           [ -n "$HERMES_URL" ] || { echo "::error::HERMES_WEBHOOK_URL not configured"; exit 1; }
           [ -n "$HERMES_SECRET" ] || { echo "::error::HERMES_WEBHOOK_SECRET not configured"; exit 1; }
           python3 --version
-          gh --version
+          # (no `gh --version`: hermes_review.py calls the GitHub API itself, and the
+          # lab-runner image has no gh CLI)
           test -f .github/scripts/hermes_review.py
 
       - name: Run Hermes AI Security Review
