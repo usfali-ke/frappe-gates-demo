@@ -1507,6 +1507,14 @@ jobs:
         if: steps.up.outcome == 'success'
         # Templates pinned to a release commit, not "latest at scan time",
         # so the same deployment gets the same verdict on a re-run.
+        # -pt http,ssl -ni: only the templates that talk to the target. The
+        # DNS / network templates query public resolvers and interactsh
+        # registers an out-of-band callback host; against this localhost
+        # target they find nothing (2026-11-10: the same 12 http + 3 ssl
+        # findings either way) but their outbound traffic saturated the lab's
+        # uplink: GitHub became unreachable during the scan (connect timeouts,
+        # reproduced) and the report upload failed (ETIMEDOUT) on two
+        # releases. TLS is audited in full by the testssl job.
         run: |
           set -uo pipefail
           mkdir -p "$OUT/dast-nuclei" && chmod 777 "$OUT/dast-nuclei"
@@ -1518,7 +1526,7 @@ jobs:
           touch "$OUT/dast-nuclei/nuclei.jsonl"
           docker run --rm --network host -v "$RUNNER_TEMP/templates:/templates:ro" -v "$PWD/$OUT/dast-nuclei:/out" "$NUCLEI" \
             -u "$BASE_URL" -t /templates -disable-update-check -duc -exclude-tags dos,fuzz,intrusive,osint \
-            -rate-limit 100 -timeout 5 -no-color -silent -jsonl -o /out/nuclei.jsonl > "$OUT/dast-nuclei/nuclei.log" 2>&1
+            -pt http,ssl -ni -rate-limit 100 -timeout 5 -no-color -silent -jsonl -o /out/nuclei.jsonl > "$OUT/dast-nuclei/nuclei.log" 2>&1
           echo "rc=$?" >> "$GITHUB_OUTPUT"
       - id: verdict
         if: ${{ !cancelled() }}
