@@ -46,7 +46,7 @@ GATES = {
         ("sast_clean", "security", [("sast-semgrep", "result")]),
         ("secrets_clean", "security", [("secrets-gitleaks", "result"), ("secrets-trufflehog", "result")]),
         ("commits_signed", "security", [("commits-signed", "result")]),
-        ("ai_security_review_clean", "security", [("ai-review", "result")]),
+        ("ai_security_review_clean", "security", [("ai-security", "result")]),
     ],
     # The Control Gate at the end of CI (devsecops-pipeline.yml): build
     # successful, every static and image control clean, before anything is
@@ -130,15 +130,10 @@ GATES = {
 
 # Controls deliberately turned off in the workflow. They stay in their gate so
 # the dashboard sees them, but they are recorded as skipped with the reason: a
-# control that did not run must never read as a pass.
-DISABLED = {
-    ("G1", "ai_security_review_clean"): (
-        "disabled in devsecops-pipeline.yml (the ai-review job is commented out): the lab Hermes "
-        "gateway's model returned \"NOT COMPLETED\" for roughly half of the review requests even with "
-        "the PR diff delivered, so the control was switched off rather than left flaky. No AI review "
-        "exists for this run."
-    ),
-}
+# control that did not run must never read as a pass. (The Hermes AI review
+# was here until 2026-11-10; it now runs on the lab-runner and blocks on
+# Critical/High as part of the PR static gate.)
+DISABLED: dict[tuple[str, str], str] = {}
 
 
 def verdict(needs, job, output):

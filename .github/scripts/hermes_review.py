@@ -629,10 +629,48 @@ def parse_review(comment: dict) -> dict:
 
     for finding in findings:
         counts[finding["severity"]] += 1
-    blocking = counts["Critical"] + counts["High"]
+        if finding["severity"] in ("Critical", "High"):
+            finding["accepted"] = accepted_risk(finding)
+    blocking = sum(1 for f in findings if f["severity"] in ("Critical", "High") and not f.get("accepted"))
+    accepted = [f for f in findings if f.get("accepted")]
+    detail = ""
+    if accepted:
+        detail = f"{len(accepted)} Critical/High accepted (security/accepted-risks.json): " + ", ".join(
+            f"{f['accepted']['id']} in {f['file'] or 'n/a'} until {f['accepted']['expires']}" for f in accepted)
     return {"status": "completed", "result": "fail" if blocking else "pass",
-            "blocking_findings": blocking, "severity_counts": counts,
-            "findings": findings, "detail": ""}
+            "blocking_findings": blocking, "accepted_findings": len(accepted), "severity_counts": counts,
+            "findings": findings, "detail": detail}
+
+
+# Accepted risks: the same register and rules as .github/scripts/verdict.py
+# accepted() (control + id, optional `match` substring, an expiry that is
+# always checked, a reason that is always shown). An AI finding's id is its
+# CWE ("CWE-89"); `match` narrows it to a file or title. This job checks out
+# the PR's BASE commit, so the register read here is the one already on the
+# base branch: a pull request cannot accept its own findings. Accepting one
+# takes its own reviewed change to security/accepted-risks.json first.
+ACCEPTED_RISKS = Path(os.environ.get("ACCEPTED_RISKS", "security/accepted-risks.json"))
+
+
+def accepted_risk(finding: dict) -> dict | None:
+    if not finding.get("cwe"):
+        return None  # no stable identity to accept: never waived
+    try:
+        register = json.loads(ACCEPTED_RISKS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    today = dt.date.today().isoformat()
+    finding_id = f"CWE-{finding['cwe']}"
+    text = f"{finding.get('file', '')} {finding.get('title', '')}"
+    for entry in register.get("accepted", []):
+        if entry.get("control") != "ai-review" or entry.get("id") != finding_id:
+            continue
+        if entry.get("match") and entry["match"] not in text:
+            continue
+        if not entry.get("reason") or entry.get("expires", "") < today:
+            continue  # an entry without a reason, or past its date, accepts nothing
+        return {k: entry[k] for k in ("id", "match", "reason", "expires") if k in entry}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +955,10 @@ def main() -> None:
             "review_status": assessment["status"],
             "result": assessment["result"],
             "blocking_findings": assessment["blocking_findings"],
+            "accepted_findings": [
+                {"id": f["accepted"]["id"], "file": f["file"], "severity": f["severity"], "title": f["title"],
+                 **{k: f["accepted"][k] for k in ("match", "reason", "expires") if k in f["accepted"]}}
+                for f in assessment["findings"] if f.get("accepted")],
             "severity_counts": assessment["severity_counts"],
             "comment_url": comment.get("html_url"),
         }
@@ -935,6 +977,9 @@ def main() -> None:
         if assessment["result"] == "fail":
             finish("fail", f"Hermes: {summary} — Critical/High block the merge; see {link}",
                    findings=len(assessment["findings"]), blocking=assessment["blocking_findings"])
+        if assessment.get("accepted_findings"):
+            finish("pass", f"Hermes: {summary}; no unaccepted Critical/High ({assessment['detail']}); see {link}",
+                   findings=len(assessment["findings"]), blocking=0, accepted=assessment["accepted_findings"])
         finish("pass", f"Hermes: {summary}; no Critical/High; see {link}",
                findings=len(assessment["findings"]), blocking=0)
 

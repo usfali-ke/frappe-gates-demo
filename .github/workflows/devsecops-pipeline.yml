@@ -61,8 +61,10 @@ on:
   # (secrets DOCKERHUB_USERNAME / DOCKERHUB_TOKEN).
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  pull_request_review:
-    types: [submitted, dismissed]
+  # No pull_request_review trigger (2026-11-10): an approval re-ran every
+  # control and, through cancel-in-progress, cancelled the PR's own run, the
+  # required "PR static gate" check with it. Approvals are policed by
+  # devsecops-approval-guard.yml instead.
   push:
     branches: [main]
     # Deploy commits (devsecops-stage.yml) change only deploy/**. To
@@ -117,6 +119,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Accepted risks from the base branch (a PR can't accept its own findings)
+        uses: ./.github/actions/base-accepted-risks
       - run: |
           mkdir -p "$OUT"
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -w /src "$SEMGREP" semgrep scan \
@@ -165,6 +169,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Accepted risks from the base branch (a PR can't accept its own findings)
+        uses: ./.github/actions/base-accepted-risks
       - run: |
           mkdir -p "$OUT"
           docker run --rm -v "$PWD:/repo" -w /repo "$GITLEAKS" git /repo --redact --verbose --no-color \
@@ -206,6 +212,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Accepted risks from the base branch (a PR can't accept its own findings)
+        uses: ./.github/actions/base-accepted-risks
       - id: scan
         # Verification calls each candidate's own API to see if it is live.
         # The secret values are dropped before anything is stored.
@@ -431,7 +439,10 @@ jobs:
   ai-security:
     name: Develop · AI security review (Hermes, PR)
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    # The Hermes gateway (HERMES_WEBHOOK_URL) is on the lab's private network:
+    # the kind lab-runner (ARC, registered to this repo) reaches it, a
+    # GitHub-hosted runner does not.
+    runs-on: lab-runner
     timeout-minutes: 40
     permissions:
       contents: read
@@ -588,6 +599,46 @@ jobs:
           path: reports/commits-signed/
           if-no-files-found: ignore
 
+  # ── PR static gate: the ONE required status check on main (ruleset).
+  #    Every static control must be `success` on the PR's head: SAST, both
+  #    secret scanners, code quality, unit tests + coverage, SCA, IaC and the
+  #    Hermes AI review (Critical/High block; accepted risks come from the
+  #    base branch's security/accepted-risks.json). A failed, cancelled or
+  #    SKIPPED control fails the gate: GitHub counts a skipped required check
+  #    as passed, so this job never is. An approval only counts once it is
+  #    green (devsecops-approval-guard.yml dismisses earlier ones). Container
+  #    build, image scan, SBOM and signing run after merge (build onwards).
+
+  pr-static-gate:
+    name: PR static gate
+    needs: [sast-semgrep, secrets-gitleaks, secrets-trufflehog, code-quality, unit-tests, sca-trivy, iac-checkov, ai-security]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every static control passed on this commit?
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          rows=$(jq -r 'to_entries[] | [.key, .value.result, ((.value.outputs.result // "{}") | (try fromjson catch {}) | (.detail // "") | gsub("[\\t\\n|]"; " ") | .[0:200])] | @tsv' <<<"$NEEDS")
+          bad=$(awk -F'\t' '$2 != "success" {printf "%s%s (%s)", (n++ ? ", " : ""), $1, $2}' <<<"$rows")
+          {
+            echo "## PR static gate: $([ -z "$bad" ] && echo PASS || echo FAIL)"
+            echo
+            echo "| Control | Result | Detail |"
+            echo "|---|---|---|"
+            awk -F'\t' '{printf "| %s | %s | %s |\n", $1, ($2 == "success" ? "pass" : $2), $3}' <<<"$rows"
+            echo
+            if [ -z "$bad" ]; then echo "Eligible for review and merge."; else echo "**Not eligible for approval or merge** until every control passes: $bad."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$bad" ]; then
+            echo "::error::PR static gate FAILED - not eligible for approval or merge: $bad"
+            exit 1
+          fi
+          echo "PR static gate: every static control passed"
+
   # ── G1 merge gate, the phase boundary Develop → Build. Mandatory on
   #    pull requests: when any Develop control failed the gate fails, and
   #    every Build job below is skipped — the pipeline stops at the phase.
@@ -598,7 +649,7 @@ jobs:
     name: G1 merge gate (Develop → Build)
     # ai-security (Hermes, above) is advisory — findings never
     # block a merge — so it is not a gate input here.
-    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed]
+    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed, ai-security]
     if: always() && startsWith(github.event_name, 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -624,11 +675,12 @@ jobs:
   build:
     name: Build · image (reproducible)
     needs: [gate-g1]
-    # The phase boundary: on a PR nothing is built until the merge gate
-    # passed — a failed G1 skips this job and the whole Build phase. On a
-    # push to main there is no G1 (skipped: the merge already happened
-    # under branch protection) and Build proceeds.
-    if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
+    # After approval and merge only (push to main, or by hand): the image
+    # build, container scan, CIS benchmark, SBOM, signing and publish never
+    # run on a pull request. They fail the run (no publish, G2 red) on any
+    # fixable Critical/High. On a push there is no G1 (skipped: the merge
+    # happened under the ruleset's required PR static gate).
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -710,13 +762,10 @@ jobs:
           if-no-files-found: ignore
 
   sca-trivy:
-    name: Build · SCA · trivy (lockfile)
-    needs: [gate-g1]
-    # The phase boundary: on a PR nothing is built until the merge gate
-    # passed — a failed G1 skips this job and the whole Build phase. On a
-    # push to main there is no G1 (skipped: the merge already happened
-    # under branch protection) and Build proceeds.
-    if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
+    name: Develop · SCA · trivy (lockfile)
+    # A static file scan: runs on every PR push, before review, as an input
+    # to the PR static gate (2026-11-10; it used to wait for G1 and ran only
+    # once G1 had passed, so a PR could pass G1 with a Critical dependency).
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -733,6 +782,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Accepted risks from the base branch (a PR can't accept its own findings)
+        uses: ./.github/actions/base-accepted-risks
       - run: |
           mkdir -p "$OUT"
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
@@ -766,13 +817,10 @@ jobs:
           if-no-files-found: ignore
 
   iac-checkov:
-    name: Build · IaC · checkov (Dockerfile + k8s render)
-    needs: [gate-g1]
-    # The phase boundary: on a PR nothing is built until the merge gate
-    # passed — a failed G1 skips this job and the whole Build phase. On a
-    # push to main there is no G1 (skipped: the merge already happened
-    # under branch protection) and Build proceeds.
-    if: ${{ !cancelled() && (needs.gate-g1.result == 'success' || needs.gate-g1.result == 'skipped') }}
+    name: Develop · IaC · checkov (Dockerfile + k8s render)
+    # A static file scan: runs on every PR push, before review, as an input
+    # to the PR static gate (2026-11-10; it used to wait for G1 and ran only
+    # once G1 had passed, so a PR could pass G1 with a Critical dependency).
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -789,6 +837,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Accepted risks from the base branch (a PR can't accept its own findings)
+        uses: ./.github/actions/base-accepted-risks
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: ${{ env.UV_VERSION }}
@@ -1234,7 +1284,7 @@ jobs:
     name: G2 Control Gate (Build → Release)
     needs: [gate-g1, build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
             image-scan, sbom, image-compliance, frappe-migrate-check, publish]
-    if: always()
+    if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
