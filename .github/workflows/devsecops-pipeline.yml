@@ -476,13 +476,11 @@ jobs:
 
       - name: Run Hermes AI Security Review
         id: verdict
-        # The script exits non-zero for a failing verdict (Critical/High, or a
-        # review that could not be rated), and always writes the verdict to the
-        # job output first. This job is advisory by design - the G1 merge gate
-        # enforces that output - so a failing verdict must not also turn the
-        # job red and read as a failed control in the PR findings comment.
-        # Anything unreadable (no output) still blocks: the gate is fail-closed.
-        continue-on-error: true
+        # The script exits non-zero for a failing verdict: unaccepted
+        # Critical/High, or a review that did not complete or could not be
+        # rated. That fails the job, and the PR static gate with it (blocking
+        # since 2026-11-10; it used to be advisory with continue-on-error, which
+        # let a review that never completed read as a passed job).
         env:
           HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
           HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
@@ -623,7 +621,16 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          rows=$(jq -r 'to_entries[] | [.key, .value.result, ((.value.outputs.result // "{}") | (try fromjson catch {}) | (.detail // "") | gsub("[\\t\\n|]"; " ") | .[0:200])] | @tsv' <<<"$NEEDS")
+          # A control counts only if its job succeeded AND its own verdict (the
+          # job's `result` output, when it has one) says pass: a step that
+          # swallows its failure can't turn a failed or incomplete control into
+          # a pass.
+          rows=$(jq -r 'to_entries[] | ((.value.outputs.result // "") | (try fromjson catch null)) as $v
+            | [.key,
+               (if .value.result != "success" then .value.result
+                elif $v != null and ($v | type) == "object" and ($v.status // "pass") != "pass" then "verdict: \($v.status)"
+                else "success" end),
+               (($v // {}) | if type == "object" then (.detail // "") else "" end | gsub("[\\t\\n|]"; " ") | .[0:200])] | @tsv' <<<"$NEEDS")
           bad=$(awk -F'\t' '$2 != "success" {printf "%s%s (%s)", (n++ ? ", " : ""), $1, $2}' <<<"$rows")
           {
             echo "## PR static gate: $([ -z "$bad" ] && echo PASS || echo FAIL)"
