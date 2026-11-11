@@ -1,0 +1,71 @@
+name: devsecops-approval-guard
+
+# Only a clean pull request is eligible for approval (2026-11-10).
+#
+# GitHub cannot hide the Approve button, so this enforces it the other way: an
+# approval submitted while the PR's required "PR static gate" check is not
+# `success` on the approved commit (failing, still running, or missing) is
+# dismissed at once, with the reason, so it never counts towards the ruleset's
+# required approval. Together with the ruleset (the PR static gate required,
+# stale approvals dismissed on push, approval of the latest push required) an
+# approval only ever counts on a commit whose static controls are all green.
+#
+# Runs from the base branch's copy of this file for a same-repo PR, like every
+# pull_request_review workflow, and needs no checkout: it reads the check run
+# and dismisses through the API with the run's own token.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+concurrency:
+  group: approval-guard-${{ github.event.pull_request.number }}-${{ github.event.review.id }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Approval guard (PR static gate must be green)
+    if: github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      checks: read
+    steps:
+      - name: Dismiss the approval unless the PR static gate passed on the approved commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.review.commit_id }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          REVIEW: ${{ github.event.review.id }}
+          REVIEWER: ${{ github.event.review.user.login }}
+        run: |
+          set -euo pipefail
+          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+          # The newest "PR static gate" run on the approved commit, from GitHub
+          # Actions itself (a commit status of the same name cannot stand in).
+          state=$(api "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=PR%20static%20gate&per_page=50" \
+            | jq -r '[.check_runs[] | select(.app.slug == "github-actions")] | sort_by(.started_at) | last
+                     | if . == null then "missing" elif .status != "completed" then .status else .conclusion end')
+          if [ "$SHA" = "$HEAD" ] && [ "$state" = "success" ]; then
+            echo "PR static gate passed on ${SHA:0:12}: the approval by $REVIEWER stands."
+            echo "Approval by **$REVIEWER** stands: the PR static gate passed on \`${SHA:0:12}\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$SHA" != "$HEAD" ]; then
+            why="it approves ${SHA:0:12}, not the PR's current head ${HEAD:0:12}"
+          else
+            case "$state" in
+              missing)                 why="the PR static gate has not run on ${SHA:0:12}" ;;
+              queued|in_progress|pending|waiting|requested) why="the PR static gate is still running on ${SHA:0:12}" ;;
+              *)                       why="the PR static gate is '$state' on ${SHA:0:12}" ;;
+            esac
+          fi
+          msg="Dismissed automatically: $why. Only a pull request whose PR static gate is green is eligible for approval (zero Critical/High in SAST, secrets, SCA, IaC and the AI review; code quality, unit tests and coverage passing). Approve again once the gate passes."
+          api -X PUT "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$PR/reviews/$REVIEW/dismissals" \
+            -d "$(jq -n --arg m "$msg" '{message: $m, event: "DISMISS"}')" > /dev/null
+          echo "::warning::Approval by $REVIEWER dismissed: $why"
+          echo "Approval by **$REVIEWER** dismissed: $why." >> "$GITHUB_STEP_SUMMARY"
