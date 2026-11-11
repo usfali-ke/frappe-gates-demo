@@ -13,8 +13,17 @@ DefectDojo's /reimport-scan/ API, one Test per control:
 
 Engagements:
   default branch (push / manual run)  -> "CI/CD"      (same as the dashboard collector)
-  pull request                        -> "PR #<n>"    (never closes findings on main)
   any other branch                    -> "Branch <name>"
+  pull request                        -> not imported: a PR's findings are its own
+                                         history (the security dashboard records what
+                                         each PR introduced, fixed or reintroduced),
+                                         linked to the one DefectDojo record per
+                                         vulnerability that runs on main keep.
+
+A control's fingerprinted findings (defectdojo.json, written by findings.py)
+are imported as "Generic Findings Import" in preference to the tool's own
+report: DefectDojo matches them on unique_id_from_tool, so a re-worded title
+or a moved line is the same finding.
 
 close_old_findings is on, scoped to the Test, so a finding fixed in code
 closes in DefectDojo. Because of that, an older run is never allowed to
@@ -50,6 +59,9 @@ from pathlib import Path
 # File name -> DefectDojo scan type, for artifacts without a manifest.
 # Order matters: first match wins.
 FILE_RULES: list[tuple[re.Pattern[str], str]] = [
+    # findings.py's fingerprinted findings (security controls): preferred
+    # over the tool's own report in the same artifact (see plan()).
+    (re.compile(r"^defectdojo\.json$"), "Generic Findings Import"),
     (re.compile(r"^semgrep\.json$"), "Semgrep JSON Report"),
     (re.compile(r"^gitleaks\.json$"), "Gitleaks Scan"),
     (re.compile(r"^trufflehog\.jsonl?$"), "Trufflehog Scan"),
@@ -254,6 +266,9 @@ def plan(artifact_dir: Path) -> list[dict]:
             scan_type = next((t for pattern, t in FILE_RULES if pattern.match(name)), None)
             if scan_type:
                 found.append((scan_type, path))
+        fingerprinted = [(t, p) for t, p in found if p.name == "defectdojo.json"]
+        if fingerprinted:
+            found = fingerprinted[:1]
         for scan_type, path in found:
             title = base if len(found) == 1 else f"{base}-{path.stem}"
             if scan_type == "CycloneDX Scan" and "sbom" not in title.lower():
@@ -308,6 +323,10 @@ def main() -> int:
     if not product:
         log("DD_PRODUCT (repo variable DEFECTDOJO_PRODUCT) is not set — nothing to do")
         return 0
+    if env("EVENT").startswith("pull_request"):
+        log("pull request run: not imported. The security dashboard records this PR's findings as PR history, "
+            "linked to the DefectDojo record that runs on main keep for each vulnerability.")
+        return 0
     artifact_dir = Path(env("ARTIFACT_DIR", "artifacts"))
     if env("GITHUB_TOKEN") and env("GITHUB_REPOSITORY") and env("RUN_ID"):
         try:
@@ -347,7 +366,10 @@ def main() -> int:
                     "test_title": title,
                     "auto_create_context": "true",
                     "close_old_findings": "true",
-                    "deduplication_on_engagement": "true",
+                    # Product-wide: the same vulnerability seen by another
+                    # test (a release stage's re-check) is marked a duplicate
+                    # of the one record, not counted twice.
+                    "deduplication_on_engagement": "false",
                     "active": "true",
                     "verified": "false",
                     "build_id": build_id,
