@@ -461,8 +461,19 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
           fetch-depth: 1
+      # This job checks out the BASE commit (trusted review tooling), which may
+      # not have the accepted-risks action yet (it didn't on the PR that added
+      # it), so the action comes from this PR's own tree, like every step of
+      # this workflow (a pull_request workflow runs the PR's definition). The
+      # register it reads is the central one either way.
+      - name: Accepted-risks action from this PR's tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: .pr-tooling
+          sparse-checkout: .github/actions/accepted-risks
       - name: Accepted risks from the central register (never from this repo or a PR)
-        uses: ./.github/actions/accepted-risks
+        uses: ./.pr-tooling/.github/actions/accepted-risks
 
       - name: Verify Hermes configuration
         env:
