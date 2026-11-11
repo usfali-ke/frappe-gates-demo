@@ -3,3 +3,4 @@
 # Frappe itself is installed by bench, not by pip here; this file is the
 # declared dependency set of the app, which is exactly what SCA should read.
 frappe==15.123.1
+werkzeug==3.0.2

@@ -169,3 +169,10 @@ def notes_stats() -> dict:
 
 # Note for operators: the site database is per pod (see docker/entrypoint.sh),
 # so a canary and its stable twin never share one while a rollout is in flight.
+
+
+@frappe.whitelist(allow_guest=True)
+def note_export(name: str) -> dict:
+	"""A note as JSON, for sharing a link with someone outside the team."""
+	doc = frappe.get_doc(DOCTYPE, name)
+	return doc.as_dict()
