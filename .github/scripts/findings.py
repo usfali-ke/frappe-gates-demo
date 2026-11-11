@@ -44,7 +44,9 @@ KIND = {
     "tool": "The tool didn't produce a usable result (it crashed, or its report is missing), so nothing was checked. "
             "This is not a clean scan. Read the tool's output (below, or in the scan step's log).",
     "findings": "Blocking findings. Fix them, or, if a finding doesn't apply, add a reviewed entry with "
-                "a reason and an expiry to `security/accepted-risks.json`.",
+                "a reason and an expiry to the central register "
+                "(usfali-ke/security-risk-register, products/frappe-gates-demo.json) "
+                "through an exception request in the security dashboard.",
     "policy": "Policy not met (see the detail line). No individual findings to list.",
 }
 

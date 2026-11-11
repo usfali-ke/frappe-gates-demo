@@ -635,7 +635,7 @@ def parse_review(comment: dict) -> dict:
     accepted = [f for f in findings if f.get("accepted")]
     detail = ""
     if accepted:
-        detail = f"{len(accepted)} Critical/High accepted (security/accepted-risks.json): " + ", ".join(
+        detail = f"{len(accepted)} Critical/High accepted (central risk register): " + ", ".join(
             f"{f['accepted']['id']} in {f['file'] or 'n/a'} until {f['accepted']['expires']}" for f in accepted)
     return {"status": "completed", "result": "fail" if blocking else "pass",
             "blocking_findings": blocking, "accepted_findings": len(accepted), "severity_counts": counts,
@@ -645,10 +645,10 @@ def parse_review(comment: dict) -> dict:
 # Accepted risks: the same register and rules as .github/scripts/verdict.py
 # accepted() (control + id, optional `match` substring, an expiry that is
 # always checked, a reason that is always shown). An AI finding's id is its
-# CWE ("CWE-89"); `match` narrows it to a file or title. This job checks out
-# the PR's BASE commit, so the register read here is the one already on the
-# base branch: a pull request cannot accept its own findings. Accepting one
-# takes its own reviewed change to security/accepted-risks.json first.
+# CWE ("CWE-89"); `match` narrows it to a file or title. The file is written
+# by .github/actions/accepted-risks from the central register
+# (usfali-ke/security-risk-register), never from this repo or a PR, so a pull
+# request cannot accept its own findings.
 ACCEPTED_RISKS = Path(os.environ.get("ACCEPTED_RISKS", "security/accepted-risks.json"))
 
 
