@@ -387,7 +387,7 @@ def publish(control, check, out, items, kind, folder, log=None):
         os.makedirs(folder, exist_ok=True)
         with open(os.path.join(folder, "findings.json"), "w") as fh:
             json.dump({"control": control, "check": check, "status": out["status"], "kind": kind if out["status"] == "fail" else None,
-                       "tool": out.get("tool"), "counts": n, "findings": items}, fh, indent=1)
+                       "tool": out.get("tool"), "counts": n, "fingerprinted": True, "findings": items}, fh, indent=1)
         # Written even with no results, so code scanning closes fixed alerts,
         # but not when the tool failed: an empty upload would close them too.
         if not (out["status"] == "fail" and kind == "tool"):
