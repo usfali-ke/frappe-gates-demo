@@ -111,7 +111,12 @@ def main():
                 {"path": str(p.relative_to(out)), "sha256": sha256(p), "bytes": p.stat().st_size}
                 for p in sorted(dest.rglob("*")) if p.is_file()
             ]
-            if dd_file and (dest / dd_file).is_file():
+            # The fingerprinted findings (findings.py, security controls) are
+            # what DefectDojo imports: one record per vulnerability across
+            # runs. The tool's own report stays in the bundle as evidence.
+            if (dest / "defectdojo.json").is_file():
+                entry["defectdojo"] = {"file": f"reports/{name}/defectdojo.json", "scan_type": "Generic Findings Import"}
+            elif dd_file and (dest / dd_file).is_file():
                 entry["defectdojo"] = {"file": f"reports/{name}/{dd_file}", "scan_type": dd_type}
         controls.append(entry)
 

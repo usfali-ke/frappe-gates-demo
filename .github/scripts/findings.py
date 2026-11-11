@@ -11,6 +11,12 @@ accepted}) and calls `publish()`, which writes, per control:
   annotations      the first blocking findings that have a file and line
   accepted-ids.txt the ids of accepted findings, so a tool's own report
                    can leave them out (trivy --ignorefile, dockle -i)
+  defectdojo.json  security controls only: the findings in DefectDojo's
+                   Generic Findings Import format, each with its
+                   `fingerprint` as unique_id_from_tool, so DefectDojo keeps
+                   ONE record per vulnerability across runs (see
+                   fingerprint() and security-dashboard
+                   docs/vulnerability-lifecycle.md)
 
 Where the tool has a readable report of its own (trivy's table, checkov's
 markdown, semgrep's text...), the job sets NATIVE to that file: the
@@ -26,7 +32,9 @@ Nothing here decides pass/fail. Secret values never reach a finding:
 the secret scanners' parsers only pass rule, file, line and commit.
 """
 
+import ast
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -49,6 +57,111 @@ KIND = {
                 "through an exception request in the security dashboard.",
     "policy": "Policy not met (see the detail line). No individual findings to list.",
 }
+
+
+# The scan kind of each security control (the dashboard's classification,
+# app/scan_tools.py). Controls not listed (tests, coverage, ruff, build,
+# signing...) are quality or policy checks: no vulnerability records.
+KIND_OF_CONTROL = {
+    "sast-semgrep": "sast", "secrets-gitleaks": "secrets", "secrets-trufflehog": "secrets",
+    "sca-trivy": "sca", "iac-checkov": "iac", "config": "iac",
+    "image-scan": "container", "image-compliance": "container",
+    "dast-nuclei": "dast", "dast-tls": "dast",
+}
+TOOL_OF_CONTROL = {
+    "sast-semgrep": "semgrep", "secrets-gitleaks": "gitleaks", "secrets-trufflehog": "trufflehog",
+    "sca-trivy": "trivy", "iac-checkov": "checkov", "config": "checkov", "image-scan": "trivy",
+    "image-compliance": "dockle", "dast-nuclei": "nuclei", "dast-tls": "testssl",
+}
+DD_SEVERITY = {"critical": "Critical", "high": "High", "unknown": "High", "medium": "Medium", "low": "Low", "info": "Info"}
+_symbols: dict = {}
+
+
+def symbol(path, line):
+    """The function (Class.method) enclosing `line` of a Python file, from
+    the source itself, or None. Part of a finding's identity: it survives
+    edits that move lines, unlike the line number."""
+    if not path or not line or not str(path).endswith(".py"):
+        return None
+    if path not in _symbols:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+        except (OSError, SyntaxError, ValueError):
+            tree = None
+        spans = []
+        if tree is not None:
+            def walk(node, prefix):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        name = f"{prefix}.{child.name}" if prefix else child.name
+                        spans.append((child.lineno, getattr(child, "end_lineno", child.lineno), name))
+                        walk(child, name)
+                    else:
+                        walk(child, prefix)
+            walk(tree, "")
+        _symbols[path] = spans
+    try:
+        line = int(line)
+    except (TypeError, ValueError):
+        return None
+    inner = [s for s in _symbols[path] if s[0] <= line <= s[1]]
+    return max(inner, key=lambda s: s[0])[2] if inner else None
+
+
+def fingerprint(f, ordinal):
+    """One vulnerability's identity across runs, PRs and DefectDojo imports:
+    control + rule/CVE id + where (file and package, or the image target /
+    URL) + the enclosing function, + an ordinal for a second hit of the same
+    rule in the same function. Never the line, the title or the wording."""
+    anchor = [f.get("file"), f.get("package")] if f.get("file") or f.get("package") else [f.get("resource") or f.get("where")]
+    parts = [f["control"].split("@", 1)[0], f["id"], *anchor, f.get("symbol") or "", str(ordinal)]
+    return "fp-" + hashlib.sha256("|".join(str(x or "") for x in parts).encode()).hexdigest()[:32]
+
+
+def defectdojo(control, items):
+    """The control's findings in DefectDojo's Generic Findings Import JSON."""
+    kind, tool = KIND_OF_CONTROL[control.split("@", 1)[0]], TOOL_OF_CONTROL[control.split("@", 1)[0]]
+    out = []
+    for f in items:
+        desc = [f"**Control:** `{control}` ({tool}) · **status in this run:** {f['status']}"]
+        if f.get("file"):
+            desc.append(f"**Where:** `{f['file']}{':' + str(f['line']) if f.get('line') else ''}`" + (f" in `{f['symbol']}`" if f.get("symbol") else ""))
+        if f.get("package"):
+            desc.append(f"**Package:** `{f['package']}` {f.get('version') or ''}" + (f" (fixed in {f['fixed_version']})" if f.get("fixed_version") else ""))
+        if f.get("where") and not f.get("file"):
+            desc.append(f"**Where:** {f['where']}")
+        if f.get("accepted"):
+            desc.append(f"**Accepted risk:** {f['accepted'].get('reason', '')} (until {f['accepted'].get('expires') or 'n/a'})")
+        desc.append(f"**Fingerprint:** `{f['fingerprint']}`")
+        item = {
+            "title": f"{f['id']}: {f.get('title') or f['id']}"[:500],
+            "severity": DD_SEVERITY[f["severity"]],
+            "description": "\n\n".join(desc),
+            "mitigation": f.get("fix") or "",
+            "references": f.get("url") or "",
+            "unique_id_from_tool": f["fingerprint"],
+            "vuln_id_from_tool": f["id"],
+            "static_finding": kind != "dast",
+            "dynamic_finding": kind == "dast",
+            "tags": sorted({f"kind:{kind}", f"control:{control.split('@', 1)[0]}", f"tool:{tool}",
+                            *([f"owasp:{f['owasp'].split(':')[0].lower()}"] if f.get("owasp") else []),
+                            *(["unrated"] if f["severity"] == "unknown" else [])}),
+        }
+        if f.get("cwe"):
+            item["cwe"] = int(f["cwe"])
+        if f.get("file"):
+            item["file_path"] = f["file"]
+            if f.get("line"):
+                item["line"] = int(f["line"])
+        if f.get("package"):
+            item["component_name"] = f["package"]
+            if f.get("version"):
+                item["component_version"] = f["version"]
+        if re.match(r"^(CVE|GHSA)-", f["id"]):
+            item["vulnerability_ids"] = [f["id"]]
+        out.append(item)
+    return {"findings": out}
 
 
 def rank(f):
@@ -257,15 +370,24 @@ def annotations(control, items):
 
 def publish(control, check, out, items, kind, folder, log=None):
     items = sorted(items, key=rank)
-    for f in items:
+    seen = {}
+    for f in sorted(items, key=lambda f: (f.get("file") or "", f.get("line") or 0, f["id"])):
         f["control"] = control
         f["key"] = key(f)
+        sym = symbol(f.get("file"), f.get("line"))
+        if sym:
+            f["symbol"] = sym
+        base = (f["key"], sym)
+        seen[base] = seen.get(base, -1) + 1
+        f["fingerprint"] = fingerprint(f, seen[base])
+        if control.split("@", 1)[0] in KIND_OF_CONTROL:
+            f["kind"] = KIND_OF_CONTROL[control.split("@", 1)[0]]
     n = counts(items)
     if folder:
         os.makedirs(folder, exist_ok=True)
         with open(os.path.join(folder, "findings.json"), "w") as fh:
             json.dump({"control": control, "check": check, "status": out["status"], "kind": kind if out["status"] == "fail" else None,
-                       "tool": out.get("tool"), "counts": n, "findings": items}, fh, indent=1)
+                       "tool": out.get("tool"), "counts": n, "fingerprinted": True, "findings": items}, fh, indent=1)
         # Written even with no results, so code scanning closes fixed alerts,
         # but not when the tool failed: an empty upload would close them too.
         if not (out["status"] == "fail" and kind == "tool"):
@@ -273,6 +395,11 @@ def publish(control, check, out, items, kind, folder, log=None):
                 json.dump(sarif(control, out.get("tool"), items), fh, indent=1)
         with open(os.path.join(folder, "accepted-ids.txt"), "w") as fh:
             fh.writelines(f"{i}\n" for i in sorted({f["id"] for f in items if f["status"] == "accepted"}))
+        # Not when the tool failed: an empty import would close every open
+        # finding of the control in DefectDojo.
+        if control.split("@", 1)[0] in KIND_OF_CONTROL and not (out["status"] == "fail" and kind == "tool"):
+            with open(os.path.join(folder, "defectdojo.json"), "w") as fh:
+                json.dump(defectdojo(control, items), fh, indent=1)
     if env("GITHUB_STEP_SUMMARY"):
         with open(env("GITHUB_STEP_SUMMARY"), "a") as fh:
             fh.write(summary(control, out, items, kind, log))

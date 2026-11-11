@@ -92,6 +92,33 @@ def found(severity, finding_id, title="", *, blocking, accepted=None, **where):
     })
 
 
+def cwe_of(*values):
+    """The first CWE number in what a tool reports ("CWE-79: ...",
+    ["cwe-89"], "CWE-310"), or None."""
+    for value in values:
+        for item in value if isinstance(value, (list, tuple)) else [value]:
+            m = re.search(r"cwe[-_ ]?(\d+)", str(item or ""), re.I)
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def owasp_of(value):
+    """The OWASP Top 10 category ("A03:2021") in semgrep's metadata, or None."""
+    for item in value if isinstance(value, (list, tuple)) else [value]:
+        m = re.search(r"A\d{2}:20\d{2}", str(item or ""))
+        if m:
+            return m.group(0)
+    return None
+
+
+# OWASP Top 10 (2021) category for findings whose tool doesn't name one.
+OWASP_COMPONENTS = "A06:2021"       # vulnerable and outdated components
+OWASP_MISCONFIG = "A05:2021"        # security misconfiguration
+OWASP_CREDENTIALS = "A07:2021"      # identification and authentication failures (hard-coded secrets)
+OWASP_CRYPTO = "A02:2021"           # cryptographic failures (TLS)
+
+
 def first_line(text, limit=200):
     return (str(text or "").strip().splitlines() or [""])[0][:limit]
 
@@ -202,6 +229,7 @@ def semgrep(path):
         found({"ERROR": "high", "WARNING": "medium", "INFO": "low"}.get(extra.get("severity")), r["check_id"],
               first_line(extra.get("message")), blocking=extra.get("severity") in ("ERROR", "WARNING"), accepted=a,
               file=r.get("path"), line=r["start"]["line"], url=meta.get("source"),
+              cwe=cwe_of(meta.get("cwe")), owasp=owasp_of(meta.get("owasp")),
               fix=f"autofix: {first_line(extra['fix'], 120)}" if extra.get("fix") else None)
         if not a:
             results.append(r)
@@ -221,6 +249,7 @@ def gitleaks(path):
         a = accepted(r.get("RuleID", ""), r.get("File", ""))
         found("high", r.get("RuleID", ""), first_line(r.get("Description")), blocking=True, accepted=a,
               file=r.get("File"), line=r.get("StartLine"), where=f"commit {r.get('Commit', '')[:7]}",
+              cwe=798, owasp=OWASP_CREDENTIALS,
               fix="treat it as leaked: rotate/revoke it first (git history keeps it), then load it from the environment")
         if not a:
             leaks.append(r)
@@ -241,7 +270,7 @@ def trufflehog(path):
         found("critical" if r.get("Verified") else "low", r["DetectorName"],
               "verified LIVE credential" if r.get("Verified") else "unverified candidate (not confirmed live)",
               blocking=bool(r.get("Verified")), accepted=a, file=git.get("file"), line=git.get("line"),
-              where=f"commit {str(git.get('commit', ''))[:7]}",
+              where=f"commit {str(git.get('commit', ''))[:7]}", cwe=798, owasp=OWASP_CREDENTIALS,
               fix="revoke it at the provider now, then remove it from the code" if r.get("Verified") else None)
         if not a:
             kept.append(r)
@@ -313,7 +342,7 @@ def trivy_fs(path):
             found(v.get("Severity"), v["VulnerabilityID"], v.get("Title") or first_line(v.get("Description")), blocking=block, accepted=a,
                   package=v["PkgName"], version=v.get("InstalledVersion"), file=r.get("Target"),
                   line=lines.get((v.get("PkgIdentifier") or {}).get("UID")), url=v.get("PrimaryURL"),
-                  fixed_version=v.get("FixedVersion"),
+                  fixed_version=v.get("FixedVersion"), cwe=cwe_of(v.get("CweIDs")), owasp=OWASP_COMPONENTS,
                   fix=f"upgrade to {v['FixedVersion']}" if v.get("FixedVersion") else "no fixed release: replace or remove the dependency")
             if a:
                 continue
@@ -349,6 +378,7 @@ def checkov(path):
         found(c.get("severity"), c["check_id"], c.get("check_name"), blocking=status == "failed", accepted=inline if status == "skipped" else None,
               file=path if in_repo else None, line=(c.get("file_line_range") or [None])[0] if in_repo else None,
               where=None if in_repo else f"{c.get('resource')} (kustomize build deploy/prod)", url=c.get("guideline"),
+              resource=c.get("resource"), owasp=OWASP_MISCONFIG,
               fix="fix it, or skip inline with a reason: " + ("`# checkov:skip=ID:reason`" if path.endswith("Dockerfile") else "`checkov.io/skipN` annotation"))
     ids = summarize(failed, lambda c: f"{c['check_id']} ({c['resource']})")
     detail = (f"{len(failed)} failed, {passed} passed, {len(skipped)} skipped with inline justification"
@@ -374,13 +404,15 @@ def trivy(path):
             found(v.get("Severity"), v["VulnerabilityID"], v.get("Title") or first_line(v.get("Description")),
                   blocking=block_unfixed or bool(v.get("FixedVersion")), accepted=a, package=v["PkgName"],
                   version=v.get("InstalledVersion"), where=r.get("Target"), url=v.get("PrimaryURL"), fixed_version=v.get("FixedVersion"),
+                  cwe=cwe_of(v.get("CweIDs")), owasp=OWASP_COMPONENTS,
                   fix=f"upgrade to {v['FixedVersion']} (rebuild on a patched base, or bump the package)" if v.get("FixedVersion") else "no upstream fix yet")
             if not a:
                 vulns.append(v)
         for s in r.get("Secrets") or []:
             a = accepted(s.get("RuleID", ""))
             found(s.get("Severity"), s.get("RuleID", ""), s.get("Title"), blocking=True, accepted=a,
-                  where=f"{r.get('Target')}:{s.get('StartLine', '')} (in the image)", fix="rotate it, and keep it out of the build context (.dockerignore)")
+                  where=f"{r.get('Target')}:{s.get('StartLine', '')} (in the image)", cwe=798, owasp=OWASP_CREDENTIALS,
+                  fix="rotate it, and keep it out of the build context (.dockerignore)")
             if not a:
                 secrets.append(s)
     blocking = vulns if block_unfixed else [v for v in vulns if v.get("FixedVersion")]
@@ -390,6 +422,7 @@ def trivy(path):
     root = user.split(":")[0] in ("", "0", "root")
     if root:
         found("high", "image-runs-as-root", f"image user is {user or 'unset (root)'}", blocking=True, file="Dockerfile",
+              cwe=250, owasp=OWASP_MISCONFIG,
               fix="add `USER <non-root uid>` to the final stage")
     detail = (f"{len(blocking)} fixable Critical/High{': ' + top if top else ''}; {len(unfixed)} without an upstream fix "
               f"({'blocking' if block_unfixed else 'reported, not blocking'}); {len(secrets)} embedded secret(s); "
@@ -435,7 +468,8 @@ def dockle(path):
             hits = [accepted(d["code"], a) for a in (d.get("alerts") or [""])]
         found({"FATAL": "high", "WARN": "medium", "INFO": "low"}.get(d["level"], "info"), d["code"], d.get("title"),
               blocking=d["level"] in ("FATAL", "WARN"), accepted=hits[0] if all(hits) else None,
-              where="; ".join(d.get("alerts") or [])[:300], url=f"https://github.com/goodwithtech/dockle#{d['code'].lower()}")
+              where="; ".join(d.get("alerts") or [])[:300], url=f"https://github.com/goodwithtech/dockle#{d['code'].lower()}",
+              owasp=OWASP_MISCONFIG)
         if not all(hits):
             kept.append(d)
     blocking = [d for d in kept if d["level"] in ("FATAL", "WARN")]
@@ -515,7 +549,8 @@ def nuclei(path):
     for r in rows:
         a, info = accepted(r.get("template-id", "")), r.get("info") or {}
         found(info.get("severity"), r.get("template-id", ""), info.get("name"), blocking=info.get("severity") in ("medium", "high", "critical"),
-              accepted=a, where=r.get("matched-at"), url=r.get("template-url"), fix=first_line(info.get("remediation"), 160) or None)
+              accepted=a, where=r.get("matched-at"), url=r.get("template-url"), fix=first_line(info.get("remediation"), 160) or None,
+              cwe=cwe_of((info.get("classification") or {}).get("cwe-id")))
         if not a:
             kept.append(r)
     rows = kept
@@ -546,7 +581,8 @@ def testssl(path):
         if f["severity"] in ("LOW", "MEDIUM", "HIGH", "CRITICAL", "FATAL"):
             found("high" if f["severity"] == "FATAL" else f["severity"], f.get("id", ""),
                   ("testssl.sh could not test this: " if f["severity"] == "FATAL" else "") + first_line(f.get("finding")),
-                  blocking=f["severity"] in ("HIGH", "CRITICAL", "FATAL"), accepted=a, where=os.environ.get("TARGET_URL") or "https://localhost:18443 (environment TLS proxy)")
+                  blocking=f["severity"] in ("HIGH", "CRITICAL", "FATAL"), accepted=a, where=os.environ.get("TARGET_URL") or "https://localhost:18443 (environment TLS proxy)",
+                  cwe=cwe_of(f.get("cwe")), owasp=OWASP_CRYPTO)
         if not a:
             kept.append(f)
     blocking = [f for f in kept if f["severity"] in ("HIGH", "CRITICAL")]
