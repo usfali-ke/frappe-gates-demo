@@ -7,7 +7,7 @@
 #   Develop   the source, before anything is built: SAST (semgrep) ·
 #             secrets (gitleaks, trufflehog) · quality (ruff: lint +
 #             complexity) · unit tests + coverage · PR: reviewers ·
-#             signed commits · AI security review
+#             signed commits · AI security review (advisory, not gated)
 #     ── G1 merge gate (Develop → Build, on pull requests): reviewed,
 #        signed, tested, no SAST or secret findings. A failed G1 skips
 #        every Build job — the pipeline does not proceed to the phase ──
@@ -43,7 +43,8 @@
 #  - A gate criterion fails closed when its control didn't run (skipped
 #    after an earlier gate failed, cancelled or crashed) — never an
 #    implicit pass; gate.py's verdict says which.
-#  - Exceptions live in security/accepted-risks.json, each with a reason
+#  - Exceptions live in the central register (usfali-ke/security-risk-register,
+#    read by .github/actions/accepted-risks; never from this repo or a PR), each with a reason
 #    and an expiry, and every verdict lists the ones it applied.
 #  - Nothing is rebuilt: Build's image tests use the `image` artifact,
 #    checked against its digest, and publish pushes those same bytes; the
@@ -119,8 +120,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Accepted risks from the base branch (a PR can't accept its own findings)
-        uses: ./.github/actions/base-accepted-risks
+      - name: Accepted risks from the central register (never from this repo or a PR)
+        uses: ./.github/actions/accepted-risks
       - run: |
           mkdir -p "$OUT"
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -w /src "$SEMGREP" semgrep scan \
@@ -169,8 +170,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Accepted risks from the base branch (a PR can't accept its own findings)
-        uses: ./.github/actions/base-accepted-risks
+      - name: Accepted risks from the central register (never from this repo or a PR)
+        uses: ./.github/actions/accepted-risks
       - run: |
           mkdir -p "$OUT"
           docker run --rm -v "$PWD:/repo" -w /repo "$GITLEAKS" git /repo --redact --verbose --no-color \
@@ -212,8 +213,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Accepted risks from the base branch (a PR can't accept its own findings)
-        uses: ./.github/actions/base-accepted-risks
+      - name: Accepted risks from the central register (never from this repo or a PR)
+        uses: ./.github/actions/accepted-risks
       - id: scan
         # Verification calls each candidate's own API to see if it is live.
         # The secret values are dropped before anything is stored.
@@ -430,11 +431,14 @@ jobs:
           path: reports/reviewers/
           if-no-files-found: ignore
 
-  # ── Hermes AI security review (PR only). Moved here from devsecops.yaml
-  #    when that workflow was retired (2026-11-09) - unchanged. Advisory:
-  #    its findings never block a merge, so it is not a G1 input. It reviews
-  #    with the tooling from the PR's BASE commit, so a PR can't change the
-  #    review that judges it.
+  # ── Hermes AI security review (PR only). ADVISORY (2026-11-11): an LLM's
+  #    labels (CWE, severity, wording) vary run to run on the same code, so
+  #    its findings are for the reviewer - a PR comment - and never gate a
+  #    merge, are never waived through the risk register and are never
+  #    imported into DefectDojo automatically. A reviewer who confirms one
+  #    records it in DefectDojo; a recurring class becomes a semgrep rule.
+  #    Not an input of the PR static gate or G1. It reviews with the tooling
+  #    from the PR's BASE commit, so a PR can't change the review it gets.
 
   ai-security:
     name: Develop · AI security review (Hermes, PR)
@@ -460,7 +464,6 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
           fetch-depth: 1
-
       - name: Verify Hermes configuration
         env:
           HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
@@ -476,11 +479,9 @@ jobs:
 
       - name: Run Hermes AI Security Review
         id: verdict
-        # The script exits non-zero for a failing verdict: unaccepted
-        # Critical/High, or a review that did not complete or could not be
-        # rated. That fails the job, and the PR static gate with it (blocking
-        # since 2026-11-10; it used to be advisory with continue-on-error, which
-        # let a review that never completed read as a passed job).
+        # Advisory: the script exits 0 whatever Hermes found (a warning
+        # annotation when there is a Critical/High) and when the review could
+        # not run. Only a broken script fails the job, and that gates nothing.
         env:
           HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL }}
           HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
@@ -515,29 +516,25 @@ jobs:
             echo ""
             if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then
               result=$(jq -r '.result // "unknown"' "$f")
+              crit=$(jq -r '.severity_counts.Critical // 0' "$f")
+              high=$(jq -r '.severity_counts.High // 0' "$f")
               case "$result" in
-                pass)
-                  echo "✅ ai-review: pass"
-                  echo ""
-                  echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
-                  echo "0 blocking finding(s) - review clean (advisory control)"
+                clean)
+                  echo "💬 ai-review (advisory): no findings"
                   ;;
-                fail)
-                  blk=$(jq -r '.blocking_findings // 0' "$f")
-                  crit=$(jq -r '.severity_counts.Critical // 0' "$f")
-                  high=$(jq -r '.severity_counts.High // 0' "$f")
-                  echo "❌ ai-review: fail (advisory job - the G1 merge gate enforces it)"
-                  echo ""
-                  echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
-                  echo "${blk} blocking finding(s): ${crit} Critical, ${high} High"
+                findings)
+                  echo "💬 ai-review (advisory): $(jq -r '[.severity_counts | to_entries[] | select(.value > 0) | "\(.value) \(.key)"] | join(", ")' "$f")"
+                  if [ $((crit + high)) -gt 0 ]; then
+                    echo ""
+                    echo "**${crit} Critical, ${high} High for the reviewer to assess.** Advisory: not a gate. A confirmed finding is recorded in DefectDojo."
+                  fi
                   ;;
                 *)
-                  echo "❌ ai-review: fail"
-                  echo ""
-                  echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
-                  echo "review not completed (status: $(jq -r '.status // "?"' "$f")) - fail-closed"
+                  echo "💬 ai-review (advisory): the review could not be rated (status: $(jq -r '.review_status // .status // "?"' "$f")). Nothing is gated on it."
                   ;;
               esac
+              echo ""
+              echo "Tool: Hermes AI security review (gateway webhook, base-SHA client)"
               url=$(jq -r '.comment_url // ""' "$f")
               if [ -n "$url" ]; then
                 echo ""
@@ -600,9 +597,10 @@ jobs:
 
   # ── PR static gate: the ONE required status check on main (ruleset).
   #    Every static control must be `success` on the PR's head: SAST, both
-  #    secret scanners, code quality, unit tests + coverage, SCA, IaC and the
-  #    Hermes AI review (Critical/High block; accepted risks come from the
-  #    base branch's security/accepted-risks.json). A failed, cancelled or
+  #    secret scanners, code quality, unit tests + coverage, SCA and IaC
+  #    (accepted risks come from the central register,
+  #    usfali-ke/security-risk-register). The Hermes AI review is advisory and
+  #    not an input. A failed, cancelled or
   #    SKIPPED control fails the gate: GitHub counts a skipped required check
   #    as passed, so this job never is. An approval only counts once it is
   #    green (devsecops-approval-guard.yml dismisses earlier ones). Container
@@ -610,7 +608,7 @@ jobs:
 
   pr-static-gate:
     name: PR static gate
-    needs: [sast-semgrep, secrets-gitleaks, secrets-trufflehog, code-quality, unit-tests, sca-trivy, iac-checkov, ai-security]
+    needs: [sast-semgrep, secrets-gitleaks, secrets-trufflehog, code-quality, unit-tests, sca-trivy, iac-checkov]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -657,7 +655,7 @@ jobs:
     name: G1 merge gate (Develop → Build)
     # ai-security (Hermes, above) is advisory — findings never
     # block a merge — so it is not a gate input here.
-    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed, ai-security]
+    needs: [reviewers, unit-tests, sast-semgrep, secrets-gitleaks, secrets-trufflehog, commits-signed]
     if: always() && startsWith(github.event_name, 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -790,8 +788,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Accepted risks from the base branch (a PR can't accept its own findings)
-        uses: ./.github/actions/base-accepted-risks
+      - name: Accepted risks from the central register (never from this repo or a PR)
+        uses: ./.github/actions/accepted-risks
       - run: |
           mkdir -p "$OUT"
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
@@ -845,8 +843,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Accepted risks from the base branch (a PR can't accept its own findings)
-        uses: ./.github/actions/base-accepted-risks
+      - name: Accepted risks from the central register (never from this repo or a PR)
+        uses: ./.github/actions/accepted-risks
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: ${{ env.UV_VERSION }}
@@ -913,6 +911,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Accepted risks from the central register (never from this repo or a PR)
+        uses: ./.github/actions/accepted-risks
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: image
@@ -1017,6 +1017,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Accepted risks from the central register (never from this repo or a PR)
+        uses: ./.github/actions/accepted-risks
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: image

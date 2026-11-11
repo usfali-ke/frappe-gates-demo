@@ -666,11 +666,17 @@ def main():
         out["tool"] = env("TOOL")
     if metrics:
         out["metrics"] = metrics
+    # Which register this verdict was graded against (the central register's
+    # commit, written by .github/actions/accepted-risks), recorded on every
+    # verdict, not only when an entry applied.
+    source = (load(env("ACCEPTED_RISKS", "security/accepted-risks.json")) or {}).get("source")
+    if source:
+        out["accepted_risks_source"] = source
     if _applied:
         out["accepted"] = _applied
         ids = sorted({a["id"] for a in _applied})
         listed = ", ".join(ids) if len(ids) <= 5 else f"{len(ids)} ids, listed in `accepted`"
-        out["detail"] = (out["detail"] + f"; accepted risks applied: {listed}")[:1000]
+        out["detail"] = (out["detail"] + f"; accepted risks applied: {listed}" + (f" (register {source})" if source else ""))[:1000]
     print(f"{out['status']}: {out['detail']}")
     if env("GITHUB_OUTPUT"):
         with open(env("GITHUB_OUTPUT"), "a") as f:

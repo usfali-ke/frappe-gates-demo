@@ -144,7 +144,7 @@ def fail_review(reason: str) -> None:
         "pr_number": int(PR_NUMBER) if PR_NUMBER.isdigit() else PR_NUMBER,
         "head_sha": HEAD_SHA,
         "control": "ai-review",
-        "status": "fail",
+        "status": "advisory",
         "detail": reason[:1000],
         "metrics": {},
         "review_status": "not_completed",
@@ -153,9 +153,10 @@ def fail_review(reason: str) -> None:
     }
 
     write_verdict(verdict)
-    write_output("result", json.dumps({"status": "fail", "detail": reason[:500], "metrics": {}}))
-
-    raise SystemExit(1)
+    write_output("result", json.dumps({"status": "advisory", "detail": f"Hermes advisory review did not run: {reason[:450]}", "metrics": {}}))
+    # Advisory: a review that couldn't run is reported, never a failed PR.
+    print(f"::warning::Hermes advisory review did not run: {reason[:500]}")
+    raise SystemExit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -563,8 +564,8 @@ def assess_finding(finding: dict) -> None:
       * the CVSS v4.0 vector and the score Hermes stated must be present and
         well-formed, otherwise the finding is flagged;
       * a label BELOW the band of Hermes's own stated score is flagged, and when
-        that band is Critical/High (the blocking levels) the severity is raised
-        to it, i.e. an inconsistency can only ever make the gate stricter;
+        that band is Critical/High the severity is raised to it, i.e. an
+        inconsistency can only ever make the advisory more prominent;
       * flags travel with the finding into the report, DefectDojo and the job
         summary, so a downgrade is visible to a human instead of silent."""
 
@@ -606,7 +607,7 @@ def parse_review(comment: dict) -> dict:
     counts = {s: 0 for s in SEVERITY_ORDER}
 
     if NOT_COMPLETED.match(first):
-        return {"status": "not_completed", "result": "error", "blocking_findings": 0,
+        return {"status": "not_completed", "result": "error", "critical_high": 0,
                 "severity_counts": counts, "findings": [],
                 "detail": "Hermes could not complete the review (no diff to review)"}
 
@@ -616,61 +617,22 @@ def parse_review(comment: dict) -> dict:
 
     declared = COUNT_HEADER.match(first)
     if declared and int(declared.group(1)) != len(findings):
-        return {"status": "not_completed", "result": "error", "blocking_findings": 0,
+        return {"status": "not_completed", "result": "error", "critical_high": 0,
                 "severity_counts": counts, "findings": findings,
                 "detail": f"comment declares {declared.group(1)} finding(s) but {len(findings)} were parsed — "
                           "comment format changed; refusing to pass"}
 
     if findings and not any(f["cvss_vector"] and f["cvss_score"] is not None for f in findings):
-        return {"status": "not_completed", "result": "error", "blocking_findings": 0,
+        return {"status": "not_completed", "result": "error", "critical_high": 0,
                 "severity_counts": counts, "findings": findings,
                 "detail": f"none of the {len(findings)} finding(s) carries a valid CVSS v4.0 vector and score: "
                           "the review did not follow the severity method; refusing to pass"}
 
     for finding in findings:
         counts[finding["severity"]] += 1
-        if finding["severity"] in ("Critical", "High"):
-            finding["accepted"] = accepted_risk(finding)
-    blocking = sum(1 for f in findings if f["severity"] in ("Critical", "High") and not f.get("accepted"))
-    accepted = [f for f in findings if f.get("accepted")]
-    detail = ""
-    if accepted:
-        detail = f"{len(accepted)} Critical/High accepted (security/accepted-risks.json): " + ", ".join(
-            f"{f['accepted']['id']} in {f['file'] or 'n/a'} until {f['accepted']['expires']}" for f in accepted)
-    return {"status": "completed", "result": "fail" if blocking else "pass",
-            "blocking_findings": blocking, "accepted_findings": len(accepted), "severity_counts": counts,
-            "findings": findings, "detail": detail}
-
-
-# Accepted risks: the same register and rules as .github/scripts/verdict.py
-# accepted() (control + id, optional `match` substring, an expiry that is
-# always checked, a reason that is always shown). An AI finding's id is its
-# CWE ("CWE-89"); `match` narrows it to a file or title. This job checks out
-# the PR's BASE commit, so the register read here is the one already on the
-# base branch: a pull request cannot accept its own findings. Accepting one
-# takes its own reviewed change to security/accepted-risks.json first.
-ACCEPTED_RISKS = Path(os.environ.get("ACCEPTED_RISKS", "security/accepted-risks.json"))
-
-
-def accepted_risk(finding: dict) -> dict | None:
-    if not finding.get("cwe"):
-        return None  # no stable identity to accept: never waived
-    try:
-        register = json.loads(ACCEPTED_RISKS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    today = dt.date.today().isoformat()
-    finding_id = f"CWE-{finding['cwe']}"
-    text = f"{finding.get('file', '')} {finding.get('title', '')}"
-    for entry in register.get("accepted", []):
-        if entry.get("control") != "ai-review" or entry.get("id") != finding_id:
-            continue
-        if entry.get("match") and entry["match"] not in text:
-            continue
-        if not entry.get("reason") or entry.get("expires", "") < today:
-            continue  # an entry without a reason, or past its date, accepts nothing
-        return {k: entry[k] for k in ("id", "match", "reason", "expires") if k in entry}
-    return None
+    critical_high = counts["Critical"] + counts["High"]
+    return {"status": "completed", "result": "findings" if findings else "clean",
+            "critical_high": critical_high, "severity_counts": counts, "findings": findings, "detail": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +772,7 @@ def build_markdown_report(assessment: dict, comment: dict, context: dict) -> str
         f"- Commit: `{HEAD_SHA}`",
         *([f"- **Not rated:** {assessment['detail']}"] if assessment.get("detail") else []),
         f"- Result: **{assessment['result'].upper()}** "
-        f"({assessment['blocking_findings']} Critical/High blocking)",
+        f"({assessment['critical_high']} Critical/High) - advisory: for the reviewer, never a gate",
         f"- Diff reviewed: {context['file_count']} file(s), {context['diff_bytes']} bytes, "
         f"sha256 `{context['diff_sha256']}`",
         f"- PR comment: {comment.get('html_url', '')}",
@@ -877,7 +839,7 @@ def finish(status: str, detail: str, **metrics) -> None:
     write_output("result", json.dumps(result))
     # verdict.json carries the same {control, status, detail, metrics} every
     # control's verdict has (the PR findings comment and findings tooling read
-    # it) next to the review's own fields (result, blocking_findings, ...).
+    # it) next to the review's own fields (result, critical_high, ...).
     try:
         current = json.loads(VERDICT_FILE.read_text(encoding="utf-8")) if VERDICT_FILE.exists() else {}
     except (OSError, ValueError):
@@ -890,9 +852,11 @@ def finish(status: str, detail: str, **metrics) -> None:
     if summary:
         with open(summary, "a", encoding="utf-8") as handle:
             handle.write(f"### AI security review · Hermes: {status}\n\n{detail}\n")
-    if status != "pass":
+    if status not in ("pass", "advisory"):
         print(f"::error::{detail[:500]}")
-    raise SystemExit(0 if status == "pass" else 1)  # a verdict is final
+    elif metrics.get("critical_high"):
+        print(f"::warning::{detail[:500]}")
+    raise SystemExit(0 if status in ("pass", "advisory") else 1)  # a verdict is final
 
 
 # ---------------------------------------------------------------------------
@@ -954,11 +918,8 @@ def main() -> None:
             "diff_sha256": context["diff_sha256"],
             "review_status": assessment["status"],
             "result": assessment["result"],
-            "blocking_findings": assessment["blocking_findings"],
-            "accepted_findings": [
-                {"id": f["accepted"]["id"], "file": f["file"], "severity": f["severity"], "title": f["title"],
-                 **{k: f["accepted"][k] for k in ("match", "reason", "expires") if k in f["accepted"]}}
-                for f in assessment["findings"] if f.get("accepted")],
+            "critical_high": assessment["critical_high"],
+            "advisory": True,
             "severity_counts": assessment["severity_counts"],
             "comment_url": comment.get("html_url"),
         }
@@ -970,18 +931,17 @@ def main() -> None:
         if flagged:
             summary += f" ({len(flagged)} flagged: {', '.join(flagged)}, see hermes-report.md)"
         link = comment.get("html_url") or ""
-        log(f"Review completed: result={assessment['result']} blocking_findings={assessment['blocking_findings']}")
+        log(f"Review completed: result={assessment['result']} critical_high={assessment['critical_high']} (advisory)")
 
+        # Advisory since 2026-11-11: an LLM's labels (CWE, severity, wording)
+        # vary run to run on the same code, so its findings never gate a merge
+        # and are never waived or tracked automatically. The reviewer reads the
+        # PR comment; a confirmed issue is recorded in DefectDojo by hand.
         if assessment["result"] == "error":
-            finish("fail", assessment["detail"], findings=0)
-        if assessment["result"] == "fail":
-            finish("fail", f"Hermes: {summary} — Critical/High block the merge; see {link}",
-                   findings=len(assessment["findings"]), blocking=assessment["blocking_findings"])
-        if assessment.get("accepted_findings"):
-            finish("pass", f"Hermes: {summary}; no unaccepted Critical/High ({assessment['detail']}); see {link}",
-                   findings=len(assessment["findings"]), blocking=0, accepted=assessment["accepted_findings"])
-        finish("pass", f"Hermes: {summary}; no Critical/High; see {link}",
-               findings=len(assessment["findings"]), blocking=0)
+            finish("advisory", f"Hermes advisory: the review could not be rated ({assessment['detail']}); nothing is gated on it",
+                   findings=0, review="not_rated")
+        finish("advisory", f"Hermes advisory: {summary}; for the reviewer, not a gate; see {link}",
+               findings=len(assessment["findings"]), critical_high=assessment["critical_high"])
 
     except Exception as exc:
         fail_review(str(exc))

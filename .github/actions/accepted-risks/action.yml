@@ -1,0 +1,51 @@
+name: Accepted risks from the central register
+description: >-
+  Writes security/accepted-risks.json for the controls' verdicts from the
+  central register (usfali-ke/security-risk-register): org.json plus this
+  product's file, both read at the same commit of the register's main. Never
+  from this repository or a pull request, so no change here can accept its own
+  findings: an exception is live only once it is merged into the register,
+  through its reviewed, validated process. Fail-closed: if the register can't
+  be read, the step fails and nothing is accepted.
+inputs:
+  product:
+    description: The product's key in the register (products/<product>.json)
+    default: frappe-gates-demo
+  register:
+    description: owner/repo of the register
+    default: usfali-ke/security-risk-register
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PRODUCT: ${{ inputs.product }}
+        REGISTER: ${{ inputs.register }}
+      run: |
+        set -euo pipefail
+        api() { curl -fsS --retry 3 --retry-all-errors --connect-timeout 20 -H "Authorization: Bearer $GH_TOKEN" "$@"; }
+        # One commit for both files: a run never mixes two versions of the register.
+        sha=$(api -H "Accept: application/vnd.github+json" "$GITHUB_API_URL/repos/$REGISTER/commits/main" | jq -r '.sha // empty') \
+          || { echo "::error::cannot read the accepted-risks register $REGISTER (fail-closed: nothing is accepted)"; exit 1; }
+        [ -n "$sha" ] || { echo "::error::the register $REGISTER has no main commit (fail-closed)"; exit 1; }
+        tmp=$(mktemp -d)
+        fetch() {  # fetch <path> <dest>: 0 = got it, 2 = not in the register, else fail
+          code=$(curl -sS --retry 3 --retry-all-errors --connect-timeout 20 -o "$2" -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
+            "$GITHUB_API_URL/repos/$REGISTER/contents/$1?ref=$sha" || echo 000)
+          case "$code" in 200) return 0 ;; 404) return 2 ;; *) echo "::error::register $REGISTER@${sha:0:12} $1: HTTP $code (fail-closed)"; return 1 ;; esac
+        }
+        fetch org.json "$tmp/org.json" || { rc=$?; [ $rc -eq 2 ] && echo '{"accepted": []}' > "$tmp/org.json" || exit 1; }
+        if fetch "products/$PRODUCT.json" "$tmp/product.json"; then :; else
+          rc=$?; [ $rc -eq 2 ] || exit 1
+          echo '{"accepted": []}' > "$tmp/product.json"
+          echo "::notice::the register has no products/$PRODUCT.json: no product-specific accepted risks"
+        fi
+        mkdir -p security
+        src="$REGISTER@$sha"
+        jq -n --arg src "$src" --slurpfile org "$tmp/org.json" --slurpfile prod "$tmp/product.json" \
+          '{source: $src, accepted: (($org[0].accepted // []) + ($prod[0].accepted // []))}' > security/accepted-risks.json
+        n=$(jq '.accepted | length' security/accepted-risks.json)
+        echo "accepted risks: $n entr$([ "$n" = 1 ] && echo y || echo ies) from $src (org.json + products/$PRODUCT.json)"
+        echo "Accepted risks: **$n** from [\`$REGISTER@${sha:0:12}\`]($GITHUB_SERVER_URL/$REGISTER/tree/$sha) (org + \`$PRODUCT\`)." >> "$GITHUB_STEP_SUMMARY"
