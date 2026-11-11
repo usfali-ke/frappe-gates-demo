@@ -490,7 +490,7 @@ def render(pr_run, baseline, bdata, comment_only=False):
         ai_verdict, ai_ch = _ai_review_from_dir(REPORTS_DIR)
         ai_base = bdata.get(AI_REVIEW_ART) if bdata else None
         if ai_verdict is not None:
-            icon = {"pass": "✅", "fail": "❌", "skipped": "⏭️"}.get(ai_verdict.get("status"), "❔")
+            icon = {"pass": "✅", "fail": "❌", "skipped": "⏭️", "advisory": "💬"}.get(ai_verdict.get("status"), "❔")
             chn = str(len(ai_ch))
             newcol = str(len({k for _i, k in ai_ch} - {k for _i, k in ai_base.get("ch", [])})) if ai_base else "–"
             lines.append(f"| {icon} | {AI_REVIEW_LABEL} | {chn} | {newcol} | {_md_cell(ai_verdict.get('detail') or '', 140)} |")

@@ -46,7 +46,7 @@ GATES = {
         ("sast_clean", "security", [("sast-semgrep", "result")]),
         ("secrets_clean", "security", [("secrets-gitleaks", "result"), ("secrets-trufflehog", "result")]),
         ("commits_signed", "security", [("commits-signed", "result")]),
-        ("ai_security_review_clean", "security", [("ai-security", "result")]),
+        # The Hermes AI review is advisory (2026-11-11): not a G1 criterion.
     ],
     # The Control Gate at the end of CI (devsecops-pipeline.yml): build
     # successful, every static and image control clean, before anything is
