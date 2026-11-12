@@ -475,10 +475,14 @@ jobs:
           echo "rc=$?" >> "$GITHUB_OUTPUT"
           mkdir -p "$OUT/trivy-config/input"
           uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py < "$OUT/${TARGET_ENV}.yaml" > "$OUT/trivy-config/input/${TARGET_ENV}.yaml"
-          # Exceptions come from the central register only (see iac-trivy).
-          grep -rnE "trivy:ignore" deploy/ > "$OUT/trivy-config/inline-ignores.txt" || true
+          # Exceptions come from the central register only (see iac-trivy):
+          # inline ignore comments and ignore/config files fail the check.
+          { grep -rnE "(trivy|tfsec):ignore:[A-Za-z0-9]" --exclude-dir=.git . || true
+            find . -path ./.git -prune -o \( -name .trivyignore -o -name .trivyignore.yaml -o -name trivy.yaml -o -name trivy.yml \) -print \
+              | sed 's|$|:0:an ignore/config file|'; } > "$OUT/trivy-config/inline-ignores.txt"
           docker run --rm -v "$PWD/$OUT/trivy-config:/work" -v "$PWD/.github/trivy:/cfg:ro" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            config --config-data /cfg --format json --output /work/trivy-config.json --exit-code 0 -q /work/input || true
+            config --config-data /cfg --ignorefile /dev/null --format json --output /work/trivy-config-render.json --exit-code 0 -q /work/input || true
+          jq '{Results: ((.Results // []) | map(.Target = "rendered/" + .Target))}' "$OUT/trivy-config/trivy-config-render.json" > "$OUT/trivy-config/trivy-config.json" || true
           # `bash -e` aborts on a failed assignment; grep exits 1 when nothing
           # changed, which is the case this line exists to detect.
           changed=$(git status --porcelain | awk '{print $2}' | grep -v '^reports/' | tr '\n' ' ' || true)
