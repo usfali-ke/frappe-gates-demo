@@ -9,7 +9,7 @@ DefectDojo's /reimport-scan/ API, one Test per control:
   * an artifact with a manifest.json (`evidence`, `release-evidence-<env>`)
     names each control's report and DefectDojo scan type itself;
   * otherwise known tool reports are recognised by file name
-    (semgrep.json, gitleaks.json, trivy-*.json, checkov results_json.json, ...).
+    (semgrep.json, gitleaks.json, trivy-*.json, ...).
 
 Engagements:
   default branch (push / manual run)  -> "CI/CD"      (same as the dashboard collector)
@@ -68,7 +68,6 @@ FILE_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^semgrep\.json$"), "Semgrep JSON Report"),
     (re.compile(r"^gitleaks\.json$"), "Gitleaks Scan"),
     (re.compile(r"^trufflehog\.jsonl?$"), "Trufflehog Scan"),
-    (re.compile(r"^(results_json|checkov)\.json$"), "Checkov Scan"),
     (re.compile(r"^trivy[-\w]*\.json$"), "Trivy Scan"),
     (re.compile(r".*\.cdx\.json$|^sbom[-\w]*\.json$"), "CycloneDX Scan"),
     (re.compile(r"^nuclei\.jsonl$"), "Nuclei Scan"),

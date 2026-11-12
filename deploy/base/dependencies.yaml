@@ -9,11 +9,11 @@
 # The Secret `frappe-gates-demo` is created out of band (never in git) with
 # keys `db-root-password` and `admin-password`.
 #
-# checkov exceptions (documented, not silenced):
-#   CKV2_K8S_6  NetworkPolicy is platform-owned — the products AppProject
-#               blacklists networking.k8s.io/NetworkPolicy for product repos.
-#   CKV_K8S_35  MariaDB takes its root password from the environment, the only
-#               way mariadbd's entrypoint accepts it; read once at start.
+# Design notes (IaC exceptions come from the central risk register only):
+#   - No NetworkPolicy here: it is platform-owned — the products AppProject
+#     blacklists networking.k8s.io/NetworkPolicy for product repos.
+#   - MariaDB takes its root password from the environment, the only way
+#     mariadbd's entrypoint accepts it; read once at start.
 ---
 apiVersion: v1
 kind: Service
@@ -35,10 +35,10 @@ metadata:
   name: frappe-gates-demo-mariadb
   labels:
     app: frappe-gates-demo-mariadb
-  annotations:
-    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy is platform-owned; the products AppProject forbids product repos from shipping one
-    checkov.io/skip2: CKV_K8S_35=The MariaDB root password is only configurable through the environment; read once at start
-    checkov.io/skip3: CKV_K8S_40=The MariaDB image's own mysql account is uid 999; mariadbd is not supported running as an arbitrary uid, and fsGroup already gives that uid the data volume
+  # MariaDB runs as the image's own mysql account, uid/gid 999 (trivy
+  # KSV-0020/0021, Low, reported): mariadbd is not supported as an arbitrary
+  # uid, and fsGroup already gives that uid the data volume. Its root
+  # password is only configurable through the environment, read once at start.
 spec:
   replicas: 1
   serviceName: frappe-gates-demo-mariadb
@@ -151,8 +151,6 @@ metadata:
   name: frappe-gates-demo-redis
   labels:
     app: frappe-gates-demo-redis
-  annotations:
-    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy is platform-owned; the products AppProject forbids product repos from shipping one
 spec:
   replicas: 1
   selector:

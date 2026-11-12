@@ -52,18 +52,6 @@ set -a
 # shellcheck source=/dev/null
 . "$env_file"
 set +a
-if [ -n "${USER_A:-}" ]; then
-  for u in A B; do
-    user="USER_$u"; pw="PASSWORD_$u"
-    # The password travels on stdin and is exported inside the pod: the app's
-    # helper reads ENSURE_USER_PASSWORD, so it never reaches argv or ps.
-    printf '%s\n' "${!pw}" | kubectl -n "$NS" exec -i "$pod" -- bash -c '
-      read -r ENSURE_USER_PASSWORD; export ENSURE_USER_PASSWORD
-      cd /home/frappe/frappe-bench
-      exec ./env/bin/python -m frappe_gates_demo.ensure_user "$0"' "${!user}"
-  done
-fi
-
 # A proxy left by a cancelled job would hold the ports.
 docker rm -f "$proxy" > /dev/null 2>&1 || true
 # caddy carries a file capability (cap_net_bind_service): without it in
@@ -83,5 +71,28 @@ curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null "${BASE_URL}/api/metho
   || { docker logs "$proxy" 2>&1 | tail -20; tail -5 "$out/port-forward.log"; exit 1; }
 cat /etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/env-ca.crt" > "$RUNNER_TEMP/env-bundle.crt"
 chmod 644 "$RUNNER_TEMP/env-ca.crt" "$RUNNER_TEMP/env-bundle.crt"   # read by tool containers running as other uids
+
+# The two test accounts, created through the app (test_support.provision)
+# over this same TLS tunnel: no shell in the pod, so the runner's Role has no
+# pods/exec. Only dev and staging have a provisioning token (the runner gets
+# it from tests/env/env-runner.sh, the pod from its Secret). Password and
+# token go in the request body and a header, never on a command line.
+if [ -n "${USER_A:-}" ]; then
+  case "$TARGET_ENV" in
+    dev) token=${TEST_PROVISIONING_TOKEN_DEV:-} ;;
+    staging) token=${TEST_PROVISIONING_TOKEN_STAGING:-} ;;
+    *) token= ;;
+  esac
+  [ -n "$token" ] || { echo "::error::no test-user provisioning token for ${TARGET_ENV} on this runner: re-run tests/env/env-runner.sh"; exit 1; }
+  for u in A B; do
+    user="USER_$u"; pw="PASSWORD_$u"
+    jq -n --arg email "${!user}" --arg password "${!pw}" '{email: $email, password: $password}' \
+      | curl -fsS --cacert "$RUNNER_TEMP/env-ca.crt" -o /dev/null -X POST \
+          -H "Content-Type: application/json" -H @<(printf 'X-Test-Provisioning-Token: %s\n' "$token") \
+          --data-binary @- "${BASE_URL}/api/method/frappe_gates_demo.test_support.provision" \
+      || { echo "::error::could not provision ${!user} in ${TARGET_ENV} (is the pod's TEST_PROVISIONING_TOKEN set?)"; exit 1; }
+  done
+  unset token
+fi
 { echo "BASE_URL=${BASE_URL}"; echo "HTTP_URL=${HTTP_URL}"; echo "ENV_PROXY=${proxy}"
   echo "ENV_CA=$RUNNER_TEMP/env-ca.crt"; echo "ENV_FILE=${env_file}"; } >> "$GITHUB_ENV"

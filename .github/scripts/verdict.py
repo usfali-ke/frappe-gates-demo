@@ -359,34 +359,67 @@ def trivy_fs(path):
     return packages > 0 and not blocking, detail, {"packages": packages, "blocking": len(blocking)}
 
 
-def checkov(path):
-    """Open-source checkov has no severities, so every failed check blocks;
-    exceptions are inline `checkov.io/skipN` annotations, counted here."""
-    reports = load(path)
-    if reports is None:
-        return missing("checkov")
-    reports = reports if isinstance(reports, list) else [reports]
-    passed = sum(r.get("summary", {}).get("passed", 0) for r in reports)
-    failed = [c for r in reports for c in r.get("results", {}).get("failed_checks", [])]
-    skipped = sorted({c["check_id"] for r in reports for c in r.get("results", {}).get("skipped_checks", [])})
-    for c, status in [(c, "failed") for c in failed] + [(c, "skipped") for r in reports for c in r.get("results", {}).get("skipped_checks", [])]:
-        # Paths are the scan copy (input/). A copy of a repo file anchors to
-        # it; a render (kustomize) has no file to point at.
-        path = (c.get("repo_file_path") or c.get("file_path") or "").split("/input/", 1)[-1]
-        in_repo = os.path.isfile(path)
-        inline = {"reason": (c.get("check_result") or {}).get("suppress_comment") or "inline checkov:skip", "expires": None}
-        found(c.get("severity"), c["check_id"], c.get("check_name"), blocking=status == "failed", accepted=inline if status == "skipped" else None,
-              file=path if in_repo else None, line=(c.get("file_line_range") or [None])[0] if in_repo else None,
-              where=None if in_repo else f"{c.get('resource')} (kustomize build deploy/prod)", url=c.get("guideline"),
-              resource=c.get("resource"), owasp=OWASP_MISCONFIG,
-              fix="fix it, or skip inline with a reason: " + ("`# checkov:skip=ID:reason`" if path.endswith("Dockerfile") else "`checkov.io/skipN` annotation"))
-    ids = summarize(failed, lambda c: f"{c['check_id']} ({c['resource']})")
-    detail = (f"{len(failed)} failed, {passed} passed, {len(skipped)} skipped with inline justification"
-              f"{' (' + ', '.join(skipped) + ')' if skipped else ''} — {', '.join(r.get('check_type', '?') for r in reports)}"
-              f"{': ' + ids if ids else ''}")
-    if not failed and not passed:
+def _k8s_objects(message):
+    """The Kubernetes objects a trivy message names ("Container 'mariadb' of
+    StatefulSet 'frappe-gates-demo-mariadb'" -> "Container mariadb, StatefulSet
+    frappe-gates-demo-mariadb"): a rendered manifest has no repo file to anchor
+    on, and these are stable where line numbers in a render are not."""
+    return ", ".join(f"{kind} {name}" for kind, name in re.findall(r"\b([A-Z][A-Za-z]+) '([^']+)'", message or ""))
+
+
+def trivy_config(path, render="kustomize build deploy/prod"):
+    """trivy config (IaC: the Dockerfile and the rendered manifests).
+    Critical/High block; Medium/Low are reported. Exceptions come from the
+    central register only (id, optional scope on the file, the Kubernetes
+    object and the message): an inline `trivy:ignore` in the repo, which
+    trivy would honour silently, fails the control (INLINE_IGNORES lists
+    them)."""
+    report = load(path)
+    if report is None:
+        return missing("trivy config")
+    inline = []
+    if env("INLINE_IGNORES"):
+        try:
+            with open(env("INLINE_IGNORES")) as f:
+                inline = [line.strip() for line in f if line.strip()]
+        except OSError:
+            pass
+    results = report.get("Results") or []
+    checks = sum((r.get("MisconfSummary") or {}).get("Successes", 0) + (r.get("MisconfSummary") or {}).get("Failures", 0) for r in results)
+    blocking, lower = [], 0
+    for r in results:
+        target = r.get("Target") or ""
+        in_repo = os.path.basename(target) == "Dockerfile"
+        for m in r.get("Misconfigurations") or []:
+            if m.get("Status") != "FAIL":
+                continue
+            cause = m.get("CauseMetadata") or {}
+            objects = cause.get("Resource") or _k8s_objects(m.get("Message"))
+            block = m.get("Severity") in ("CRITICAL", "HIGH")
+            a = accepted(m["ID"], f"{'Dockerfile' if in_repo else target} {objects} {m.get('Message', '')}")
+            found(m.get("Severity"), m["ID"], m.get("Title"), blocking=block, accepted=a,
+                  file="Dockerfile" if in_repo else None, line=cause.get("StartLine") if in_repo else None,
+                  resource=None if in_repo else objects, where=None if in_repo else f"{objects or target} ({render})",
+                  url=m.get("PrimaryURL"), owasp=OWASP_MISCONFIG, fix=first_line(m.get("Resolution"), 160) or None)
+            if a:
+                continue
+            if block:
+                blocking.append(m)
+            else:
+                lower += 1
+    for hit in inline:
+        file, _, rest = hit.partition(":")
+        line = rest.partition(":")[0]
+        found("high", "inline-trivy-ignore", "an inline trivy:ignore: IaC exceptions come from the central risk register only",
+              blocking=True, file=file, line=int(line) if line.isdigit() else None,
+              fix="remove it, and raise an exception request in the security dashboard if the finding is acceptable")
+    ids = summarize(blocking, lambda m: f"{m['ID']} ({_k8s_objects(m.get('Message')) or m.get('Title', '')})")
+    scanned = " + ".join((["Dockerfile"] if any(os.path.basename(r.get("Target") or "") == "Dockerfile" for r in results) else []) + [render])
+    detail = (f"{len(blocking)} Critical/High, {lower} lower, {checks} checks (trivy config: {scanned})"
+              f"{'; ' + str(len(inline)) + ' inline trivy:ignore (not allowed)' if inline else ''}{': ' + ids if ids else ''}")
+    if not checks:
         tool_broke()
-    return not failed and passed > 0, detail, {"failed": len(failed), "passed": passed}
+    return checks > 0 and not blocking and not inline, detail, {"blocking": len(blocking), "lower": lower, "checks": checks}
 
 
 def trivy(path):
@@ -685,7 +718,7 @@ def result(status, detail):
 
 CHECKS = {f.__name__.replace("_", "-"): f for f in (
     reviewers, commits, tests, coverage, semgrep, gitleaks, trufflehog,
-    build, trivy_fs, checkov, trivy, sbom, signed,
+    build, trivy_fs, trivy_config, trivy, sbom, signed,
     dockle, frappe_migrate, k6, nuclei, testssl, kubeconform, ruff, health, result,
 )}
 

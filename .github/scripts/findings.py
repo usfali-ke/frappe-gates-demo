@@ -18,8 +18,8 @@ accepted}) and calls `publish()`, which writes, per control:
                    fingerprint() and security-dashboard
                    docs/vulnerability-lifecycle.md)
 
-Where the tool has a readable report of its own (trivy's table, checkov's
-markdown, semgrep's text...), the job sets NATIVE to that file: the
+Where the tool has a readable report of its own (trivy's table,
+semgrep's text...), the job sets NATIVE to that file: the
 summary then keeps only the verdict, the why, the upgrade plan and the
 accepted risks, and `python3 findings.py native` shows the tool's report
 under it (and in the log).
@@ -64,14 +64,14 @@ KIND = {
 # signing...) are quality or policy checks: no vulnerability records.
 KIND_OF_CONTROL = {
     "sast-semgrep": "sast", "secrets-gitleaks": "secrets", "secrets-trufflehog": "secrets",
-    "sca-trivy": "sca", "iac-checkov": "iac", "config": "iac",
+    "sca-trivy": "sca", "iac-trivy": "iac", "config": "iac",
     "image-scan": "container", "image-compliance": "container",
     "dependency-check": "container",  # the release stage's re-check of the deployed image
     "dast-nuclei": "dast", "dast-tls": "dast",
 }
 TOOL_OF_CONTROL = {
     "sast-semgrep": "semgrep", "secrets-gitleaks": "gitleaks", "secrets-trufflehog": "trufflehog",
-    "sca-trivy": "trivy", "iac-checkov": "checkov", "config": "checkov", "image-scan": "trivy", "dependency-check": "trivy",
+    "sca-trivy": "trivy", "iac-trivy": "trivy", "config": "trivy", "image-scan": "trivy", "dependency-check": "trivy",
     "image-compliance": "dockle", "dast-nuclei": "nuclei", "dast-tls": "testssl",
 }
 DD_SEVERITY = {"critical": "Critical", "high": "High", "unknown": "High", "medium": "Medium", "low": "Low", "info": "Info"}

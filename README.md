@@ -79,7 +79,7 @@ runs:
 * `devsecops-pipeline.yml` — CI. **Develop**: semgrep SAST, gitleaks +
   trufflehog, ruff, unit tests + coverage, PR reviewers, commit signatures, AI
   review → **G1 merge gate** → **Build**: image built twice and compared
-  (reproducible), trivy SCA from `requirements.txt`, checkov on the Dockerfile
+  (reproducible), trivy SCA from `requirements.txt`, trivy config (IaC) on the Dockerfile
   and the rendered overlays, trivy on the image, syft SBOM, dockle, and the
   Frappe-specific control `frappe-migrate-check` (the image creates a site,
   installs the app and migrates against a real MariaDB — the equivalent of the
