@@ -368,12 +368,14 @@ def _k8s_objects(message):
 
 
 def trivy_config(path, render="kustomize build deploy/prod"):
-    """trivy config (IaC: the Dockerfile and the rendered manifests).
+    """trivy config (IaC): every IaC file in the repository, of every type
+    trivy supports (Dockerfiles, Kubernetes, Helm, Terraform, CloudFormation,
+    Azure ARM, Ansible), plus the rendered manifests (targets "rendered/...").
     Critical/High block; Medium/Low are reported. Exceptions come from the
-    central register only (id, optional scope on the file, the Kubernetes
-    object and the message): an inline `trivy:ignore` in the repo, which
-    trivy would honour silently, fails the control (INLINE_IGNORES lists
-    them)."""
+    central register only (id, optional scope on the file, the resource or
+    Kubernetes object, and the message): an inline ignore comment or an
+    ignore/config file in the repo, which trivy would honour silently, fails
+    the control (INLINE_IGNORES lists them)."""
     report = load(path)
     if report is None:
         return missing("trivy config")
@@ -385,21 +387,35 @@ def trivy_config(path, render="kustomize build deploy/prod"):
         except OSError:
             pass
     results = report.get("Results") or []
+    # The render first: a Kubernetes object in deploy/base and in the render
+    # is one finding (anchored on the object), reported where it is deployed.
+    results = sorted(results, key=lambda r: not (r.get("Target") or "").startswith("rendered/"))
     checks = sum((r.get("MisconfSummary") or {}).get("Successes", 0) + (r.get("MisconfSummary") or {}).get("Failures", 0) for r in results)
-    blocking, lower = [], 0
+    blocking, lower, seen, types = [], 0, set(), set()
     for r in results:
         target = r.get("Target") or ""
-        in_repo = os.path.basename(target) == "Dockerfile"
+        rendered = target.startswith("rendered/")
+        k8s = rendered or (r.get("Type") or "").lower() == "kubernetes"
+        types.add("rendered manifests" if rendered else (r.get("Type") or "?"))
         for m in r.get("Misconfigurations") or []:
             if m.get("Status") != "FAIL":
                 continue
             cause = m.get("CauseMetadata") or {}
-            objects = cause.get("Resource") or _k8s_objects(m.get("Message"))
+            objects = _k8s_objects(m.get("Message")) if k8s else (cause.get("Resource") or "")
+            if k8s:
+                key = (m["ID"], objects)
+                if objects and key in seen:
+                    continue  # the same object in deploy/base and in the render
+                seen.add(key)
             block = m.get("Severity") in ("CRITICAL", "HIGH")
-            a = accepted(m["ID"], f"{'Dockerfile' if in_repo else target} {objects} {m.get('Message', '')}")
+            a = accepted(m["ID"], f"{target} {objects} {m.get('Message', '')}")
+            line = cause.get("StartLine")
             found(m.get("Severity"), m["ID"], m.get("Title"), blocking=block, accepted=a,
-                  file="Dockerfile" if in_repo else None, line=cause.get("StartLine") if in_repo else None,
-                  resource=None if in_repo else objects, where=None if in_repo else f"{objects or target} ({render})",
+                  # Files are anchored on their path; Kubernetes objects on the
+                  # object (stable across deploy/base, the render and line moves).
+                  file=None if k8s else target, line=None if k8s else line,
+                  resource=objects or None,
+                  where=(f"{objects or target} ({render})" if rendered else f"{target}:{line}" if line else target) if k8s else None,
                   url=m.get("PrimaryURL"), owasp=OWASP_MISCONFIG, fix=first_line(m.get("Resolution"), 160) or None)
             if a:
                 continue
@@ -409,14 +425,13 @@ def trivy_config(path, render="kustomize build deploy/prod"):
                 lower += 1
     for hit in inline:
         file, _, rest = hit.partition(":")
-        line = rest.partition(":")[0]
-        found("high", "inline-trivy-ignore", "an inline trivy:ignore: IaC exceptions come from the central risk register only",
-              blocking=True, file=file, line=int(line) if line.isdigit() else None,
+        line, _, what = rest.partition(":")
+        found("high", "inline-trivy-ignore", f"{what or 'an inline ignore comment'}: IaC exceptions come from the central risk register only",
+              blocking=True, file=file.removeprefix("./"), line=int(line) if line.isdigit() and line != "0" else None,
               fix="remove it, and raise an exception request in the security dashboard if the finding is acceptable")
-    ids = summarize(blocking, lambda m: f"{m['ID']} ({_k8s_objects(m.get('Message')) or m.get('Title', '')})")
-    scanned = " + ".join((["Dockerfile"] if any(os.path.basename(r.get("Target") or "") == "Dockerfile" for r in results) else []) + [render])
-    detail = (f"{len(blocking)} Critical/High, {lower} lower, {checks} checks (trivy config: {scanned})"
-              f"{'; ' + str(len(inline)) + ' inline trivy:ignore (not allowed)' if inline else ''}{': ' + ids if ids else ''}")
+    ids = summarize(blocking, lambda m: f"{m['ID']} ({_k8s_objects(m.get('Message')) or (m.get('CauseMetadata') or {}).get('Resource') or m.get('Title', '')})")
+    detail = (f"{len(blocking)} Critical/High, {lower} lower, {checks} checks (trivy config: {', '.join(sorted(types)) or 'nothing found to scan'})"
+              f"{'; ' + str(len(inline)) + ' inline ignore(s) or ignore file(s) (not allowed)' if inline else ''}{': ' + ids if ids else ''}")
     if not checks:
         tool_broke()
     return checks > 0 and not blocking and not inline, detail, {"blocking": len(blocking), "lower": lower, "checks": checks}

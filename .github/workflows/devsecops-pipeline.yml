@@ -822,7 +822,7 @@ jobs:
           if-no-files-found: ignore
 
   iac-trivy:
-    name: Develop · IaC · trivy config (Dockerfile + k8s render)
+    name: Develop · IaC · trivy config (whole repository + k8s render)
     # A static file scan: runs on every PR push, before review, as an input
     # to the PR static gate. trivy config replaced checkov (2026-11-12): its
     # checks carry severities, so IaC blocks on Critical/High like every
@@ -853,19 +853,33 @@ jobs:
           enable-cache: false
       - run: |
           set -uo pipefail
-          mkdir -p "$OUT/input"
-          cp Dockerfile "$OUT/input/Dockerfile"
-          # trivy's Kubernetes checks don't know Argo Rollouts, so the Rollout
-          # is scanned as the Deployment it is equivalent to (scan_view.py) —
-          # never applied. Prod's render: every overlay is deploy/base plus
-          # names and a digest.
-          kubectl kustomize deploy/prod | uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > "$OUT/input/prod.yaml" || exit 0
-          # Exceptions come from the central register only: an inline
-          # `trivy:ignore` (which trivy honours silently) would let a PR
-          # waive its own finding. Listed here; the verdict fails on any.
-          grep -rnE "trivy:ignore" Dockerfile deploy/ > "$OUT/inline-ignores.txt" || true
-          docker run --rm -v "$PWD/$OUT:/work" -v "$PWD/.github/trivy:/cfg:ro" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            config --config-data /cfg --format json --output /work/trivy-config.json --exit-code 0 -q /work/input || true
+          mkdir -p "$OUT" "$RUNNER_TEMP/rendered"
+          # 1. The WHOLE repository, every IaC type trivy supports, nothing
+          #    skipped and no file types listed: Dockerfiles anywhere,
+          #    Kubernetes YAML, Helm charts, Terraform, CloudFormation, Azure
+          #    ARM, Ansible. A new IaC file is scanned the day it is added.
+          #    No ignore file is used (--ignorefile /dev/null).
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/.github/trivy:/cfg:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            config --config-data /cfg --ignorefile /dev/null --format json --output /out/trivy-config-repo.json --exit-code 0 -q /src || true
+          # 2. Plus the manifests as deployed: deploy/ is kustomize overlays,
+          #    and trivy's Kubernetes checks don't know Argo Rollouts, so the
+          #    raw Rollout passes unchecked. Prod's render, with the Rollout
+          #    as the Deployment it is equivalent to (scan_view.py, never
+          #    applied), is what checks the app's pod spec. Outside the
+          #    checkout, so scan 1 doesn't see it.
+          kubectl kustomize deploy/prod | uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > "$RUNNER_TEMP/rendered/prod.yaml" || exit 0
+          docker run --rm -v "$RUNNER_TEMP/rendered:/rendered:ro" -v "$PWD/.github/trivy:/cfg:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            config --config-data /cfg --ignorefile /dev/null --format json --output /out/trivy-config-render.json --exit-code 0 -q /rendered || true
+          # One report: the render's targets marked "rendered/".
+          jq -s '{Results: ((.[0].Results // []) + ((.[1].Results // []) | map(.Target = "rendered/" + .Target)))}' \
+            "$OUT/trivy-config-repo.json" "$OUT/trivy-config-render.json" > "$OUT/trivy-config.json" || true
+          # Exceptions come from the central register only. trivy honours an
+          # inline ignore comment (trivy:ignore:<ID>, tfsec's legacy form)
+          # and a .trivyignore / trivy.yaml silently, so a PR could waive its
+          # own finding: any of them, anywhere in the repo, fails the verdict.
+          { grep -rnE "(trivy|tfsec):ignore:[A-Za-z0-9]" --exclude-dir=.git . || true
+            find . -path ./.git -prune -o \( -name .trivyignore -o -name .trivyignore.yaml -o -name trivy.yaml -o -name trivy.yml \) -print \
+              | sed 's|$|:0:an ignore/config file|'; } > "$OUT/inline-ignores.txt"
       - id: verdict
         if: always()
         env:
