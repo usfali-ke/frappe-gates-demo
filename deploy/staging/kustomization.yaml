@@ -9,6 +9,24 @@ resources:
   - ../base
 
 patches:
+  # Test users for the authenticated suites (tests/env/env-up.sh) are
+  # created through the app, with this token, instead of a shell in the pod
+  # (no pods/exec: deploy/base/rbac.yaml). dev and staging only: prod never
+  # has the token, so the provisioning call doesn't exist there. The Secret
+  # is created by tests/env/env-runner.sh, never committed; optional, so a
+  # cluster without it still deploys (the authenticated suites then fail
+  # with "test-user provisioning is not enabled").
+  - target: {kind: Rollout, name: frappe-gates-demo}
+    patch: |
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: TEST_PROVISIONING_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: frappe-gates-demo-test-provisioning
+              key: token
+              optional: true
   - target: {kind: Rollout, name: frappe-gates-demo}
     patch: |
       - op: replace
