@@ -63,6 +63,20 @@ def _http_url(url: str) -> str:
     return url
 
 
+def _http_opener() -> urllib.request.OpenerDirector:
+    """An opener that CAN only speak HTTP(S): no file:, ftp: or data:
+    handler is installed, so even a URL that slipped past _http_url can't
+    read a local file (the dynamic-urllib-use-detected concern, fixed in
+    the opener rather than waived with a nosemgrep)."""
+    opener = urllib.request.OpenerDirector()
+    # UnknownHandler makes every other scheme an error ("unknown url type"):
+    # without it OpenerDirector.open quietly returns None for one.
+    for handler in (urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(), urllib.request.HTTPDefaultErrorHandler(),
+                    urllib.request.HTTPRedirectHandler(), urllib.request.HTTPErrorProcessor(), urllib.request.UnknownHandler()):
+        opener.add_handler(handler)
+    return opener
+
+
 def run_gh(*args: str, timeout: int = 120) -> str:
     """
     Read-only GitHub access using the workflow's GITHUB_TOKEN over the REST
@@ -109,7 +123,7 @@ def _gh_http(url: str, accept: str, timeout: int) -> str:
         "User-Agent": "hermes-review",
     })
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosemgrep: dynamic-urllib-use-detected -- scheme checked by _http_url
+        with _http_opener().open(request, timeout=timeout) as response:
             return response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:300]
@@ -312,7 +326,7 @@ def send_to_hermes(payload_bytes: bytes) -> None:
     SENT_AT = dt.datetime.now(dt.timezone.utc)
 
     try:
-        with urllib.request.urlopen(  # nosemgrep: dynamic-urllib-use-detected -- scheme checked by _http_url
+        with _http_opener().open(
             request,
             timeout=60,
         ) as response:

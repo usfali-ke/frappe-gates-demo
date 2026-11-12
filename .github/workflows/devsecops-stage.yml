@@ -475,10 +475,14 @@ jobs:
           echo "rc=$?" >> "$GITHUB_OUTPUT"
           mkdir -p "$OUT/trivy-config/input"
           uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py < "$OUT/${TARGET_ENV}.yaml" > "$OUT/trivy-config/input/${TARGET_ENV}.yaml"
-          # Exceptions come from the central register only (see iac-trivy).
-          grep -rnE "trivy:ignore" deploy/ > "$OUT/trivy-config/inline-ignores.txt" || true
+          # Exceptions come from the central register only (see iac-trivy):
+          # inline ignore comments and ignore/config files fail the check.
+          { grep -rnE "(trivy|tfsec):ignore:[A-Za-z0-9]" --exclude-dir=.git . || true
+            find . -path ./.git -prune -o \( -name .trivyignore -o -name .trivyignore.yaml -o -name trivy.yaml -o -name trivy.yml \) -print \
+              | sed 's|$|:0:an ignore/config file|'; } > "$OUT/trivy-config/inline-ignores.txt"
           docker run --rm -v "$PWD/$OUT/trivy-config:/work" -v "$PWD/.github/trivy:/cfg:ro" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            config --config-data /cfg --format json --output /work/trivy-config.json --exit-code 0 -q /work/input || true
+            config --config-data /cfg --ignorefile /dev/null --format json --output /work/trivy-config-render.json --exit-code 0 -q /work/input || true
+          jq '{Results: ((.Results // []) | map(.Target = "rendered/" + .Target))}' "$OUT/trivy-config/trivy-config-render.json" > "$OUT/trivy-config/trivy-config.json" || true
           # `bash -e` aborts on a failed assignment; grep exits 1 when nothing
           # changed, which is the case this line exists to detect.
           changed=$(git status --porcelain | awk '{print $2}' | grep -v '^reports/' | tr '\n' ' ' || true)
@@ -1200,7 +1204,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live -m smoke against ${{ inputs.environment }} (read-only: no test users, no writes)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/smoke/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/smoke/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1253,7 +1257,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_integration.py against ${{ inputs.environment }} (TLS ingress, sessions, auth, API and pages on one database)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/integration/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/integration/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1306,7 +1310,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_e2e.py against ${{ inputs.environment }} (user journeys through the pages and their forms)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/e2e/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/e2e/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1359,7 +1363,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_regression.py against ${{ inputs.environment }} (fixed or decided behaviour that must not come back)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/regression/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/regression/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1412,7 +1416,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_security.py against ${{ inputs.environment }} (OWASP Top 10 with two users: IDOR, CSRF, sessions, headers, injection)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/security-tests/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/security-tests/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1641,7 +1645,7 @@ jobs:
         run: |
           mkdir -p "$OUT/dependency-check" && chmod 777 "$OUT/dependency-check"
           docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            image --scanners vuln --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
+            image --ignore-unfixed --scanners vuln,secret --ignorefile /dev/null --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
       - id: verdict
         if: ${{ !cancelled() }}
         env:

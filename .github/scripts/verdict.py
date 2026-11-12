@@ -33,11 +33,6 @@ import re
 import sys
 import tomllib
 
-# The only XML parsed here is JUnit/coverage output from this job's own
-# pytest run. The runner's Python links expat >= 2.4.1, so ElementTree
-# resolves no external entities and refuses entity-expansion bombs — the
-# risks semgrep's use-defused-xml-parse rule is about.
-import xml.etree.ElementTree as ET  # nosemgrep: python.lang.security.use-defused-xml.use-defused-xml
 
 import findings
 
@@ -119,6 +114,43 @@ OWASP_CREDENTIALS = "A07:2021"      # identification and authentication failures
 OWASP_CRYPTO = "A02:2021"           # cryptographic failures (TLS)
 
 
+def xml_root(path):
+    """The root element of an XML report this job wrote (JUnit, coverage),
+    parsed with defusedxml: no external entities, no DTD tricks, no
+    entity-expansion bombs (what semgrep's use-defused-xml rules ask for).
+    Imported here, not at the top, so every other control keeps running on
+    the bare runner's python3; the jobs that parse XML run this script with
+    `uv run --with defusedxml`. Any unreadable or refused report is a
+    ValueError."""
+    from defusedxml.ElementTree import parse
+
+    try:
+        return parse(path).getroot()
+    except OSError:
+        raise
+    except Exception as exc:  # ParseError, DTDForbidden, EntitiesForbidden...
+        raise ValueError(f"{path}: not a usable XML report ({type(exc).__name__}: {exc})") from exc
+
+
+def waivers(kind="an inline ignore comment"):
+    """Blocking findings for every in-repo waiver a scanner would honour
+    silently (INLINE_IGNORES: "<file>:<line>:<what>" lines, written by the
+    job): exceptions come from the central risk register only, never from
+    the code under review. Returns how many there were."""
+    try:
+        with open(env("INLINE_IGNORES") or "") as f:
+            hits = [line.strip() for line in f if line.strip()]
+    except OSError:
+        return 0
+    for hit in hits:
+        file, _, rest = hit.partition(":")
+        line, _, what = rest.partition(":")
+        found("high", "in-repo-waiver", f"{what or kind}: exceptions come from the central risk register only",
+              blocking=True, file=file.removeprefix("./"), line=int(line) if line.isdigit() and line != "0" else None,
+              fix="remove it, and raise an exception request in the security dashboard if the finding is acceptable")
+    return len(hits)
+
+
 def first_line(text, limit=200):
     return (str(text or "").strip().splitlines() or [""])[0][:limit]
 
@@ -189,7 +221,7 @@ def tests(pattern):
     RC is the test command's exit code (also catches collection errors)."""
     passed = total = 0
     for path in glob.glob(pattern, recursive=True):
-        for case in ET.parse(path).getroot().iter("testcase"):  # nosemgrep: python.lang.security.use-defused-xml-parse.use-defused-xml-parse
+        for case in xml_root(path).iter("testcase"):
             tags = {child.tag for child in case}
             if "skipped" in tags:
                 continue
@@ -208,8 +240,8 @@ def tests(pattern):
 def coverage(path):
     threshold = float(env("COVERAGE_THRESHOLD"))
     try:
-        rate = ET.parse(path).getroot().get("line-rate")  # nosemgrep: python.lang.security.use-defused-xml-parse.use-defused-xml-parse
-    except (OSError, ET.ParseError):
+        rate = xml_root(path).get("line-rate")
+    except (OSError, ValueError):
         rate = None
     if rate is None:
         return False, "no coverage report", {"coverage_pct": 0.0, "threshold_pct": threshold}
@@ -254,7 +286,9 @@ def gitleaks(path):
         if not a:
             leaks.append(r)
     where = summarize(leaks, lambda r: f"{r['RuleID']} ({r['File']}:{r['StartLine']} @{r.get('Commit', '')[:7]})", 6)
-    return not leaks, f"{len(leaks)} leak(s) in {env('SCOPE', 'the repository')} (values redacted){': ' + where if where else ''}", {"leaks": len(leaks)}
+    refused = waivers("a gitleaks config file")
+    extra = f"; {refused} in-repo gitleaks config (not allowed)" if refused else ""
+    return not leaks and not refused, f"{len(leaks)} leak(s) in {env('SCOPE', 'the repository')} (values redacted){extra}{': ' + where if where else ''}", {"leaks": len(leaks)}
 
 
 def trufflehog(path):
@@ -277,10 +311,12 @@ def trufflehog(path):
     rows = kept
     verified = [r for r in rows if r.get("Verified")]
     where = summarize(verified, lambda r: f"{r['DetectorName']} ({((r.get('SourceMetadata') or {}).get('Data') or {}).get('Git', {}).get('file', '?')})", 6)
-    detail = f"{len(verified)} verified live credential(s), {len(rows) - len(verified)} unverified candidate(s) in full git history{': ' + where if where else ''}"
+    refused = waivers("an inline trufflehog:ignore")
+    detail = (f"{len(verified)} verified live credential(s), {len(rows) - len(verified)} unverified candidate(s) in full git history"
+              f"{f'; {refused} inline trufflehog:ignore (not allowed)' if refused else ''}{': ' + where if where else ''}")
     if env("RC") != "0":
         tool_broke()
-    return env("RC") == "0" and not verified, detail, {"verified": len(verified), "unverified": len(rows) - len(verified)}
+    return env("RC") == "0" and not verified and not refused, detail, {"verified": len(verified), "unverified": len(rows) - len(verified)}
 
 
 # --- G2 ---------------------------------------------------------------------
@@ -368,38 +404,47 @@ def _k8s_objects(message):
 
 
 def trivy_config(path, render="kustomize build deploy/prod"):
-    """trivy config (IaC: the Dockerfile and the rendered manifests).
+    """trivy config (IaC): every IaC file in the repository, of every type
+    trivy supports (Dockerfiles, Kubernetes, Helm, Terraform, CloudFormation,
+    Azure ARM, Ansible), plus the rendered manifests (targets "rendered/...").
     Critical/High block; Medium/Low are reported. Exceptions come from the
-    central register only (id, optional scope on the file, the Kubernetes
-    object and the message): an inline `trivy:ignore` in the repo, which
-    trivy would honour silently, fails the control (INLINE_IGNORES lists
-    them)."""
+    central register only (id, optional scope on the file, the resource or
+    Kubernetes object, and the message): an inline ignore comment or an
+    ignore/config file in the repo, which trivy would honour silently, fails
+    the control (INLINE_IGNORES lists them)."""
     report = load(path)
     if report is None:
         return missing("trivy config")
-    inline = []
-    if env("INLINE_IGNORES"):
-        try:
-            with open(env("INLINE_IGNORES")) as f:
-                inline = [line.strip() for line in f if line.strip()]
-        except OSError:
-            pass
     results = report.get("Results") or []
+    # The render first: a Kubernetes object in deploy/base and in the render
+    # is one finding (anchored on the object), reported where it is deployed.
+    results = sorted(results, key=lambda r: not (r.get("Target") or "").startswith("rendered/"))
     checks = sum((r.get("MisconfSummary") or {}).get("Successes", 0) + (r.get("MisconfSummary") or {}).get("Failures", 0) for r in results)
-    blocking, lower = [], 0
+    blocking, lower, seen, types = [], 0, set(), set()
     for r in results:
         target = r.get("Target") or ""
-        in_repo = os.path.basename(target) == "Dockerfile"
+        rendered = target.startswith("rendered/")
+        k8s = rendered or (r.get("Type") or "").lower() == "kubernetes"
+        types.add("rendered manifests" if rendered else (r.get("Type") or "?"))
         for m in r.get("Misconfigurations") or []:
             if m.get("Status") != "FAIL":
                 continue
             cause = m.get("CauseMetadata") or {}
-            objects = cause.get("Resource") or _k8s_objects(m.get("Message"))
+            objects = _k8s_objects(m.get("Message")) if k8s else (cause.get("Resource") or "")
+            if k8s:
+                key = (m["ID"], objects)
+                if objects and key in seen:
+                    continue  # the same object in deploy/base and in the render
+                seen.add(key)
             block = m.get("Severity") in ("CRITICAL", "HIGH")
-            a = accepted(m["ID"], f"{'Dockerfile' if in_repo else target} {objects} {m.get('Message', '')}")
+            a = accepted(m["ID"], f"{target} {objects} {m.get('Message', '')}")
+            line = cause.get("StartLine")
             found(m.get("Severity"), m["ID"], m.get("Title"), blocking=block, accepted=a,
-                  file="Dockerfile" if in_repo else None, line=cause.get("StartLine") if in_repo else None,
-                  resource=None if in_repo else objects, where=None if in_repo else f"{objects or target} ({render})",
+                  # Files are anchored on their path; Kubernetes objects on the
+                  # object (stable across deploy/base, the render and line moves).
+                  file=None if k8s else target, line=None if k8s else line,
+                  resource=objects or None,
+                  where=(f"{objects or target} ({render})" if rendered else f"{target}:{line}" if line else target) if k8s else None,
                   url=m.get("PrimaryURL"), owasp=OWASP_MISCONFIG, fix=first_line(m.get("Resolution"), 160) or None)
             if a:
                 continue
@@ -407,25 +452,23 @@ def trivy_config(path, render="kustomize build deploy/prod"):
                 blocking.append(m)
             else:
                 lower += 1
-    for hit in inline:
-        file, _, rest = hit.partition(":")
-        line = rest.partition(":")[0]
-        found("high", "inline-trivy-ignore", "an inline trivy:ignore: IaC exceptions come from the central risk register only",
-              blocking=True, file=file, line=int(line) if line.isdigit() else None,
-              fix="remove it, and raise an exception request in the security dashboard if the finding is acceptable")
-    ids = summarize(blocking, lambda m: f"{m['ID']} ({_k8s_objects(m.get('Message')) or m.get('Title', '')})")
-    scanned = " + ".join((["Dockerfile"] if any(os.path.basename(r.get("Target") or "") == "Dockerfile" for r in results) else []) + [render])
-    detail = (f"{len(blocking)} Critical/High, {lower} lower, {checks} checks (trivy config: {scanned})"
-              f"{'; ' + str(len(inline)) + ' inline trivy:ignore (not allowed)' if inline else ''}{': ' + ids if ids else ''}")
+    inline = waivers("an inline ignore comment")
+    ids = summarize(blocking, lambda m: f"{m['ID']} ({_k8s_objects(m.get('Message')) or (m.get('CauseMetadata') or {}).get('Resource') or m.get('Title', '')})")
+    detail = (f"{len(blocking)} Critical/High, {lower} lower, {checks} checks (trivy config: {', '.join(sorted(types)) or 'nothing found to scan'})"
+              f"{'; ' + str(inline) + ' inline ignore(s) or ignore file(s) (not allowed)' if inline else ''}{': ' + ids if ids else ''}")
     if not checks:
         tool_broke()
     return checks > 0 and not blocking and not inline, detail, {"blocking": len(blocking), "lower": lower, "checks": checks}
 
 
 def trivy(path):
-    """Critical/High with a released fix block; ones with no upstream fix
-    are reported but don't block (BLOCK_UNFIXED=true to block them too).
-    Any embedded secret blocks. Plus "hardened base": a non-root USER."""
+    """Critical/High (and unrated) with a released fix block; ones with no
+    upstream fix are reported but don't block (BLOCK_UNFIXED=true to block
+    them too); Medium/Low are reported. The scan keeps every severity (no
+    --severity) but, by decision (2026-11-12: prioritise what can be fixed),
+    runs with --ignore-unfixed: a vulnerability with no released fix isn't
+    recorded until one exists. Any embedded secret blocks. Plus "hardened
+    base": a non-root USER."""
     report = load(path)
     if report is None:
         return missing("trivy")
@@ -434,8 +477,9 @@ def trivy(path):
     for r in report.get("Results") or []:
         for v in r.get("Vulnerabilities") or []:
             a = accepted(v["VulnerabilityID"], fixed=bool(v.get("FixedVersion")))
+            serious = v.get("Severity") in ("CRITICAL", "HIGH", "UNKNOWN", None)
             found(v.get("Severity"), v["VulnerabilityID"], v.get("Title") or first_line(v.get("Description")),
-                  blocking=block_unfixed or bool(v.get("FixedVersion")), accepted=a, package=v["PkgName"],
+                  blocking=serious and (block_unfixed or bool(v.get("FixedVersion"))), accepted=a, package=v["PkgName"],
                   version=v.get("InstalledVersion"), where=r.get("Target"), url=v.get("PrimaryURL"), fixed_version=v.get("FixedVersion"),
                   cwe=cwe_of(v.get("CweIDs")), owasp=OWASP_COMPONENTS,
                   fix=f"upgrade to {v['FixedVersion']} (rebuild on a patched base, or bump the package)" if v.get("FixedVersion") else "no upstream fix yet")
@@ -448,8 +492,9 @@ def trivy(path):
                   fix="rotate it, and keep it out of the build context (.dockerignore)")
             if not a:
                 secrets.append(s)
-    blocking = vulns if block_unfixed else [v for v in vulns if v.get("FixedVersion")]
-    unfixed = [v for v in vulns if not v.get("FixedVersion")]
+    serious = [v for v in vulns if v.get("Severity") in ("CRITICAL", "HIGH", "UNKNOWN", None)]
+    blocking = serious if block_unfixed else [v for v in serious if v.get("FixedVersion")]
+    unfixed = [v for v in serious if not v.get("FixedVersion")]
     top = summarize(blocking, lambda v: f"{v['VulnerabilityID']} ({v['PkgName']})")
     user = ((report.get("Metadata") or {}).get("ImageConfig") or {}).get("config", {}).get("User", "").strip()
     root = user.split(":")[0] in ("", "0", "root")
@@ -457,8 +502,8 @@ def trivy(path):
         found("high", "image-runs-as-root", f"image user is {user or 'unset (root)'}", blocking=True, file="Dockerfile",
               cwe=250, owasp=OWASP_MISCONFIG,
               fix="add `USER <non-root uid>` to the final stage")
-    detail = (f"{len(blocking)} fixable Critical/High{': ' + top if top else ''}; {len(unfixed)} without an upstream fix "
-              f"({'blocking' if block_unfixed else 'reported, not blocking'}); {len(secrets)} embedded secret(s); "
+    detail = (f"{len(blocking)} fixable Critical/High{': ' + top if top else ''}; {len(unfixed)} Critical/High without an upstream fix "
+              f"({'blocking' if block_unfixed else 'reported, not blocking'}); {len(vulns) - len(serious)} Medium/Low (reported); {len(secrets)} embedded secret(s); "
               f"runs as {user or 'root (no USER)'}; base {env('BASE_IMAGE', '?')[:40]}")
     return not blocking and not secrets and not root, detail, {"blocking": len(blocking), "unfixed": len(unfixed)}
 
@@ -727,7 +772,7 @@ def main():
     check, args = sys.argv[1], sys.argv[2:]
     try:
         ok, detail, metrics = CHECKS[check](*args)
-    except (OSError, ValueError, KeyError, TypeError, IndexError, ET.ParseError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, IndexError, ImportError) as exc:
         ok, detail, metrics = False, f"{check}: could not evaluate ({type(exc).__name__}: {exc})", None
         tool_broke()
     out = {"status": "skipped" if ok == "skipped" else "pass" if ok else "fail", "detail": detail[:1000]}
