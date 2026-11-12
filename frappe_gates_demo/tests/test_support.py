@@ -18,6 +18,7 @@ class TestSupport(FrappeTestCase):
 	def tearDown(self):
 		frappe.db.rollback()
 		os.environ.pop("ENSURE_USER_PASSWORD", None)
+		os.environ.pop("TEST_PROVISIONING_TOKEN", None)
 
 	def test_ensure_user_creates_an_enabled_account_with_the_given_roles(self):
 		test_support.ensure_user(EMAIL, "S3cret!pass", roles=("All",))
@@ -44,3 +45,43 @@ class TestSupport(FrappeTestCase):
 		os.environ["ENSURE_USER_PASSWORD"] = "Fr0m!the-env"
 		self.assertEqual(test_support.ensure_user_from_env(EMAIL), EMAIL)
 		self.assertTrue(frappe.db.exists("User", EMAIL))
+
+
+class TestProvision(FrappeTestCase):
+	"""The pipeline's way to create the two live accounts without a shell in
+	the pod: off without a token (prod), and narrow when on."""
+
+	TOKEN = "t" * 43
+	PASSWORD = "A-long-enough-pass!"
+
+	def tearDown(self):
+		frappe.db.rollback()
+		os.environ.pop("TEST_PROVISIONING_TOKEN", None)
+
+	def call(self, token, email=EMAIL, password=None):
+		return test_support._provision(email, password or self.PASSWORD, token)
+
+	def test_without_a_token_in_the_pod_it_does_not_exist(self):
+		with self.assertRaises(frappe.DoesNotExistError):
+			self.call(self.TOKEN)
+		self.assertFalse(frappe.db.exists("User", EMAIL))
+
+	def test_a_wrong_or_missing_token_is_refused(self):
+		os.environ["TEST_PROVISIONING_TOKEN"] = self.TOKEN
+		for token in ("", "t" * 42, "x" * 43):
+			with self.assertRaises(frappe.PermissionError):
+				self.call(token)
+		self.assertFalse(frappe.db.exists("User", EMAIL))
+
+	def test_only_test_accounts_with_a_long_password(self):
+		os.environ["TEST_PROVISIONING_TOKEN"] = self.TOKEN
+		for email in ("admin@example.com", "Administrator", "a@example.test.evil.com", ""):
+			with self.assertRaises(frappe.ValidationError):
+				self.call(self.TOKEN, email=email)
+		with self.assertRaises(frappe.ValidationError):
+			self.call(self.TOKEN, password="short")
+
+	def test_with_the_token_it_creates_the_account(self):
+		os.environ["TEST_PROVISIONING_TOKEN"] = self.TOKEN
+		self.assertEqual(self.call(self.TOKEN), {"user": EMAIL})
+		self.assertTrue(frappe.db.exists("Has Role", {"parent": EMAIL, "role": "Desk User"}))

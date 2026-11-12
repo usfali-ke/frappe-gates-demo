@@ -45,7 +45,7 @@ CONTROLS = {
     "secrets-gitleaks": ("develop", "gitleaks.json", "Gitleaks Scan"),
     "secrets-trufflehog": ("develop", "trufflehog.jsonl", "Trufflehog Scan"),
     "sca-trivy": ("build", "trivy-fs.json", "Trivy Scan"),
-    "iac-checkov": ("build", "checkov.json", "Checkov Scan"),
+    "iac-trivy": ("build", "trivy-config.json", "Trivy Scan"),
     "reviewers": ("develop", None, None),
     "commits-signed": ("develop", None, None),
     "ai-review": ("develop", None, None),
@@ -58,7 +58,7 @@ CONTROLS = {
     "promotion": ("deliver", None, None),
     "provenance": ("deliver", None, None),
     "evidence-check": ("deliver", None, None),
-    "config": ("deliver", "checkov/results_json.json", "Checkov Scan"),
+    "config": ("deliver", "trivy-config/trivy-config.json", "Trivy Scan"),
     "previous-env-tests": ("deliver", None, None),
     "release-notes": ("release", None, None),
     "rollback-plan": ("release", None, None),
@@ -111,7 +111,12 @@ def main():
                 {"path": str(p.relative_to(out)), "sha256": sha256(p), "bytes": p.stat().st_size}
                 for p in sorted(dest.rglob("*")) if p.is_file()
             ]
-            if dd_file and (dest / dd_file).is_file():
+            # The fingerprinted findings (findings.py, security controls) are
+            # what DefectDojo imports: one record per vulnerability across
+            # runs. The tool's own report stays in the bundle as evidence.
+            if (dest / "defectdojo.json").is_file():
+                entry["defectdojo"] = {"file": f"reports/{name}/defectdojo.json", "scan_type": "Generic Findings Import"}
+            elif dd_file and (dest / dd_file).is_file():
                 entry["defectdojo"] = {"file": f"reports/{name}/{dd_file}", "scan_type": dd_type}
         controls.append(entry)
 

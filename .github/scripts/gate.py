@@ -63,7 +63,7 @@ GATES = {
         ("sast_clean", "security", [("sast-semgrep", "result")]),
         ("secrets_clean", "security", [("secrets-gitleaks", "result"), ("secrets-trufflehog", "result")]),
         ("sca_clean", "security", [("sca-trivy", "result")]),
-        ("iac_clean", "security", [("iac-checkov", "result")]),
+        ("iac_clean", "security", [("iac-trivy", "result")]),
         ("container_image_scan_hardened_base", "security", [("image-scan", "result")]),
         ("compliance_scan_clean", "security", [("image-compliance", "result"), ("frappe-migrate-check", "result")]),
         ("artifact_signed_attested", "security", [("publish", "result")]),

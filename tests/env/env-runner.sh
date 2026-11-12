@@ -59,6 +59,26 @@ done
   > "$kubeconfig")
 unset token
 
+# Test-user provisioning tokens (frappe_gates_demo.test_support.provision):
+# one per environment that runs authenticated suites, in a Secret the dev /
+# staging pods read (deploy/<env>/kustomization.yaml) and passed to the runner
+# here, like the kubeconfig. This replaces a shell in the pod (pods/exec),
+# which the env-tester Role no longer has. Created once; a pod picks a new
+# one up on its next rollout. Never on a command line: stdin only.
+prov_secret=frappe-gates-demo-test-provisioning
+prov_env=()
+for pair in dev:frappe-gates-demo-dev staging:frappe-gates-demo-stg; do
+  env=${pair%%:*}; ns=${pair#*:}
+  if ! kubectl -n "$ns" get secret "$prov_secret" >/dev/null 2>&1; then
+    python3 -c 'import secrets; print(secrets.token_urlsafe(32), end="")' \
+      | kubectl -n "$ns" create secret generic "$prov_secret" --from-file=token=/dev/stdin >/dev/null
+  fi
+  value=$(kubectl -n "$ns" get secret "$prov_secret" -o jsonpath='{.data.token}' | base64 -d)
+  [ -n "$value" ] || { echo "no token in ${ns}/${prov_secret}" >&2; exit 1; }
+  prov_env+=("TEST_PROVISIONING_TOKEN_$(tr '[:lower:]' '[:upper:]' <<<"$env")=$value")
+done
+unset value
+
 registration=$(curl -fsS -X POST -H "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN is not set}" \
   -H "Accept: application/vnd.github+json" \
   "https://api.github.com/repos/${repo}/actions/runners/registration-token" | jq -r .token)
@@ -71,4 +91,4 @@ unset registration
 # eyeballs). With DNS handing out an unroutable NAT64 address, the IPv6
 # attempts time out and the artifact upload fails with ETIMEDOUT, even at
 # 2 s per address under load: IPv4 first, no racing.
-exec env -u GH_TOKEN KUBECONFIG="$kubeconfig" NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection" ./run.sh
+exec env -u GH_TOKEN KUBECONFIG="$kubeconfig" "${prov_env[@]}" NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection" ./run.sh

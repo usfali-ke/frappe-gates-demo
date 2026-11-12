@@ -92,6 +92,33 @@ def found(severity, finding_id, title="", *, blocking, accepted=None, **where):
     })
 
 
+def cwe_of(*values):
+    """The first CWE number in what a tool reports ("CWE-79: ...",
+    ["cwe-89"], "CWE-310"), or None."""
+    for value in values:
+        for item in value if isinstance(value, (list, tuple)) else [value]:
+            m = re.search(r"cwe[-_ ]?(\d+)", str(item or ""), re.I)
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def owasp_of(value):
+    """The OWASP Top 10 category ("A03:2021") in semgrep's metadata, or None."""
+    for item in value if isinstance(value, (list, tuple)) else [value]:
+        m = re.search(r"A\d{2}:20\d{2}", str(item or ""))
+        if m:
+            return m.group(0)
+    return None
+
+
+# OWASP Top 10 (2021) category for findings whose tool doesn't name one.
+OWASP_COMPONENTS = "A06:2021"       # vulnerable and outdated components
+OWASP_MISCONFIG = "A05:2021"        # security misconfiguration
+OWASP_CREDENTIALS = "A07:2021"      # identification and authentication failures (hard-coded secrets)
+OWASP_CRYPTO = "A02:2021"           # cryptographic failures (TLS)
+
+
 def first_line(text, limit=200):
     return (str(text or "").strip().splitlines() or [""])[0][:limit]
 
@@ -202,6 +229,7 @@ def semgrep(path):
         found({"ERROR": "high", "WARNING": "medium", "INFO": "low"}.get(extra.get("severity")), r["check_id"],
               first_line(extra.get("message")), blocking=extra.get("severity") in ("ERROR", "WARNING"), accepted=a,
               file=r.get("path"), line=r["start"]["line"], url=meta.get("source"),
+              cwe=cwe_of(meta.get("cwe")), owasp=owasp_of(meta.get("owasp")),
               fix=f"autofix: {first_line(extra['fix'], 120)}" if extra.get("fix") else None)
         if not a:
             results.append(r)
@@ -221,6 +249,7 @@ def gitleaks(path):
         a = accepted(r.get("RuleID", ""), r.get("File", ""))
         found("high", r.get("RuleID", ""), first_line(r.get("Description")), blocking=True, accepted=a,
               file=r.get("File"), line=r.get("StartLine"), where=f"commit {r.get('Commit', '')[:7]}",
+              cwe=798, owasp=OWASP_CREDENTIALS,
               fix="treat it as leaked: rotate/revoke it first (git history keeps it), then load it from the environment")
         if not a:
             leaks.append(r)
@@ -241,7 +270,7 @@ def trufflehog(path):
         found("critical" if r.get("Verified") else "low", r["DetectorName"],
               "verified LIVE credential" if r.get("Verified") else "unverified candidate (not confirmed live)",
               blocking=bool(r.get("Verified")), accepted=a, file=git.get("file"), line=git.get("line"),
-              where=f"commit {str(git.get('commit', ''))[:7]}",
+              where=f"commit {str(git.get('commit', ''))[:7]}", cwe=798, owasp=OWASP_CREDENTIALS,
               fix="revoke it at the provider now, then remove it from the code" if r.get("Verified") else None)
         if not a:
             kept.append(r)
@@ -313,7 +342,7 @@ def trivy_fs(path):
             found(v.get("Severity"), v["VulnerabilityID"], v.get("Title") or first_line(v.get("Description")), blocking=block, accepted=a,
                   package=v["PkgName"], version=v.get("InstalledVersion"), file=r.get("Target"),
                   line=lines.get((v.get("PkgIdentifier") or {}).get("UID")), url=v.get("PrimaryURL"),
-                  fixed_version=v.get("FixedVersion"),
+                  fixed_version=v.get("FixedVersion"), cwe=cwe_of(v.get("CweIDs")), owasp=OWASP_COMPONENTS,
                   fix=f"upgrade to {v['FixedVersion']}" if v.get("FixedVersion") else "no fixed release: replace or remove the dependency")
             if a:
                 continue
@@ -330,33 +359,67 @@ def trivy_fs(path):
     return packages > 0 and not blocking, detail, {"packages": packages, "blocking": len(blocking)}
 
 
-def checkov(path):
-    """Open-source checkov has no severities, so every failed check blocks;
-    exceptions are inline `checkov.io/skipN` annotations, counted here."""
-    reports = load(path)
-    if reports is None:
-        return missing("checkov")
-    reports = reports if isinstance(reports, list) else [reports]
-    passed = sum(r.get("summary", {}).get("passed", 0) for r in reports)
-    failed = [c for r in reports for c in r.get("results", {}).get("failed_checks", [])]
-    skipped = sorted({c["check_id"] for r in reports for c in r.get("results", {}).get("skipped_checks", [])})
-    for c, status in [(c, "failed") for c in failed] + [(c, "skipped") for r in reports for c in r.get("results", {}).get("skipped_checks", [])]:
-        # Paths are the scan copy (input/). A copy of a repo file anchors to
-        # it; a render (kustomize) has no file to point at.
-        path = (c.get("repo_file_path") or c.get("file_path") or "").split("/input/", 1)[-1]
-        in_repo = os.path.isfile(path)
-        inline = {"reason": (c.get("check_result") or {}).get("suppress_comment") or "inline checkov:skip", "expires": None}
-        found(c.get("severity"), c["check_id"], c.get("check_name"), blocking=status == "failed", accepted=inline if status == "skipped" else None,
-              file=path if in_repo else None, line=(c.get("file_line_range") or [None])[0] if in_repo else None,
-              where=None if in_repo else f"{c.get('resource')} (kustomize build deploy/prod)", url=c.get("guideline"),
-              fix="fix it, or skip inline with a reason: " + ("`# checkov:skip=ID:reason`" if path.endswith("Dockerfile") else "`checkov.io/skipN` annotation"))
-    ids = summarize(failed, lambda c: f"{c['check_id']} ({c['resource']})")
-    detail = (f"{len(failed)} failed, {passed} passed, {len(skipped)} skipped with inline justification"
-              f"{' (' + ', '.join(skipped) + ')' if skipped else ''} — {', '.join(r.get('check_type', '?') for r in reports)}"
-              f"{': ' + ids if ids else ''}")
-    if not failed and not passed:
+def _k8s_objects(message):
+    """The Kubernetes objects a trivy message names ("Container 'mariadb' of
+    StatefulSet 'frappe-gates-demo-mariadb'" -> "Container mariadb, StatefulSet
+    frappe-gates-demo-mariadb"): a rendered manifest has no repo file to anchor
+    on, and these are stable where line numbers in a render are not."""
+    return ", ".join(f"{kind} {name}" for kind, name in re.findall(r"\b([A-Z][A-Za-z]+) '([^']+)'", message or ""))
+
+
+def trivy_config(path, render="kustomize build deploy/prod"):
+    """trivy config (IaC: the Dockerfile and the rendered manifests).
+    Critical/High block; Medium/Low are reported. Exceptions come from the
+    central register only (id, optional scope on the file, the Kubernetes
+    object and the message): an inline `trivy:ignore` in the repo, which
+    trivy would honour silently, fails the control (INLINE_IGNORES lists
+    them)."""
+    report = load(path)
+    if report is None:
+        return missing("trivy config")
+    inline = []
+    if env("INLINE_IGNORES"):
+        try:
+            with open(env("INLINE_IGNORES")) as f:
+                inline = [line.strip() for line in f if line.strip()]
+        except OSError:
+            pass
+    results = report.get("Results") or []
+    checks = sum((r.get("MisconfSummary") or {}).get("Successes", 0) + (r.get("MisconfSummary") or {}).get("Failures", 0) for r in results)
+    blocking, lower = [], 0
+    for r in results:
+        target = r.get("Target") or ""
+        in_repo = os.path.basename(target) == "Dockerfile"
+        for m in r.get("Misconfigurations") or []:
+            if m.get("Status") != "FAIL":
+                continue
+            cause = m.get("CauseMetadata") or {}
+            objects = cause.get("Resource") or _k8s_objects(m.get("Message"))
+            block = m.get("Severity") in ("CRITICAL", "HIGH")
+            a = accepted(m["ID"], f"{'Dockerfile' if in_repo else target} {objects} {m.get('Message', '')}")
+            found(m.get("Severity"), m["ID"], m.get("Title"), blocking=block, accepted=a,
+                  file="Dockerfile" if in_repo else None, line=cause.get("StartLine") if in_repo else None,
+                  resource=None if in_repo else objects, where=None if in_repo else f"{objects or target} ({render})",
+                  url=m.get("PrimaryURL"), owasp=OWASP_MISCONFIG, fix=first_line(m.get("Resolution"), 160) or None)
+            if a:
+                continue
+            if block:
+                blocking.append(m)
+            else:
+                lower += 1
+    for hit in inline:
+        file, _, rest = hit.partition(":")
+        line = rest.partition(":")[0]
+        found("high", "inline-trivy-ignore", "an inline trivy:ignore: IaC exceptions come from the central risk register only",
+              blocking=True, file=file, line=int(line) if line.isdigit() else None,
+              fix="remove it, and raise an exception request in the security dashboard if the finding is acceptable")
+    ids = summarize(blocking, lambda m: f"{m['ID']} ({_k8s_objects(m.get('Message')) or m.get('Title', '')})")
+    scanned = " + ".join((["Dockerfile"] if any(os.path.basename(r.get("Target") or "") == "Dockerfile" for r in results) else []) + [render])
+    detail = (f"{len(blocking)} Critical/High, {lower} lower, {checks} checks (trivy config: {scanned})"
+              f"{'; ' + str(len(inline)) + ' inline trivy:ignore (not allowed)' if inline else ''}{': ' + ids if ids else ''}")
+    if not checks:
         tool_broke()
-    return not failed and passed > 0, detail, {"failed": len(failed), "passed": passed}
+    return checks > 0 and not blocking and not inline, detail, {"blocking": len(blocking), "lower": lower, "checks": checks}
 
 
 def trivy(path):
@@ -374,13 +437,15 @@ def trivy(path):
             found(v.get("Severity"), v["VulnerabilityID"], v.get("Title") or first_line(v.get("Description")),
                   blocking=block_unfixed or bool(v.get("FixedVersion")), accepted=a, package=v["PkgName"],
                   version=v.get("InstalledVersion"), where=r.get("Target"), url=v.get("PrimaryURL"), fixed_version=v.get("FixedVersion"),
+                  cwe=cwe_of(v.get("CweIDs")), owasp=OWASP_COMPONENTS,
                   fix=f"upgrade to {v['FixedVersion']} (rebuild on a patched base, or bump the package)" if v.get("FixedVersion") else "no upstream fix yet")
             if not a:
                 vulns.append(v)
         for s in r.get("Secrets") or []:
             a = accepted(s.get("RuleID", ""))
             found(s.get("Severity"), s.get("RuleID", ""), s.get("Title"), blocking=True, accepted=a,
-                  where=f"{r.get('Target')}:{s.get('StartLine', '')} (in the image)", fix="rotate it, and keep it out of the build context (.dockerignore)")
+                  where=f"{r.get('Target')}:{s.get('StartLine', '')} (in the image)", cwe=798, owasp=OWASP_CREDENTIALS,
+                  fix="rotate it, and keep it out of the build context (.dockerignore)")
             if not a:
                 secrets.append(s)
     blocking = vulns if block_unfixed else [v for v in vulns if v.get("FixedVersion")]
@@ -390,6 +455,7 @@ def trivy(path):
     root = user.split(":")[0] in ("", "0", "root")
     if root:
         found("high", "image-runs-as-root", f"image user is {user or 'unset (root)'}", blocking=True, file="Dockerfile",
+              cwe=250, owasp=OWASP_MISCONFIG,
               fix="add `USER <non-root uid>` to the final stage")
     detail = (f"{len(blocking)} fixable Critical/High{': ' + top if top else ''}; {len(unfixed)} without an upstream fix "
               f"({'blocking' if block_unfixed else 'reported, not blocking'}); {len(secrets)} embedded secret(s); "
@@ -435,7 +501,8 @@ def dockle(path):
             hits = [accepted(d["code"], a) for a in (d.get("alerts") or [""])]
         found({"FATAL": "high", "WARN": "medium", "INFO": "low"}.get(d["level"], "info"), d["code"], d.get("title"),
               blocking=d["level"] in ("FATAL", "WARN"), accepted=hits[0] if all(hits) else None,
-              where="; ".join(d.get("alerts") or [])[:300], url=f"https://github.com/goodwithtech/dockle#{d['code'].lower()}")
+              where="; ".join(d.get("alerts") or [])[:300], url=f"https://github.com/goodwithtech/dockle#{d['code'].lower()}",
+              owasp=OWASP_MISCONFIG)
         if not all(hits):
             kept.append(d)
     blocking = [d for d in kept if d["level"] in ("FATAL", "WARN")]
@@ -515,7 +582,8 @@ def nuclei(path):
     for r in rows:
         a, info = accepted(r.get("template-id", "")), r.get("info") or {}
         found(info.get("severity"), r.get("template-id", ""), info.get("name"), blocking=info.get("severity") in ("medium", "high", "critical"),
-              accepted=a, where=r.get("matched-at"), url=r.get("template-url"), fix=first_line(info.get("remediation"), 160) or None)
+              accepted=a, where=r.get("matched-at"), url=r.get("template-url"), fix=first_line(info.get("remediation"), 160) or None,
+              cwe=cwe_of((info.get("classification") or {}).get("cwe-id")))
         if not a:
             kept.append(r)
     rows = kept
@@ -546,7 +614,8 @@ def testssl(path):
         if f["severity"] in ("LOW", "MEDIUM", "HIGH", "CRITICAL", "FATAL"):
             found("high" if f["severity"] == "FATAL" else f["severity"], f.get("id", ""),
                   ("testssl.sh could not test this: " if f["severity"] == "FATAL" else "") + first_line(f.get("finding")),
-                  blocking=f["severity"] in ("HIGH", "CRITICAL", "FATAL"), accepted=a, where=os.environ.get("TARGET_URL") or "https://localhost:18443 (environment TLS proxy)")
+                  blocking=f["severity"] in ("HIGH", "CRITICAL", "FATAL"), accepted=a, where=os.environ.get("TARGET_URL") or "https://localhost:18443 (environment TLS proxy)",
+                  cwe=cwe_of(f.get("cwe")), owasp=OWASP_CRYPTO)
         if not a:
             kept.append(f)
     blocking = [f for f in kept if f["severity"] in ("HIGH", "CRITICAL")]
@@ -649,7 +718,7 @@ def result(status, detail):
 
 CHECKS = {f.__name__.replace("_", "-"): f for f in (
     reviewers, commits, tests, coverage, semgrep, gitleaks, trufflehog,
-    build, trivy_fs, checkov, trivy, sbom, signed,
+    build, trivy_fs, trivy_config, trivy, sbom, signed,
     dockle, frappe_migrate, k6, nuclei, testssl, kubeconform, ruff, health, result,
 )}
 
