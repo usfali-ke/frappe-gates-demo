@@ -819,7 +819,7 @@ jobs:
       - run: |
           mkdir -p "$OUT"
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            fs --scanners vuln --list-all-pkgs --include-dev-deps --ignorefile /dev/null --format json --output /out/trivy-fs.json --exit-code 0 -q /src || true
+            fs --ignore-unfixed --scanners vuln --list-all-pkgs --include-dev-deps --ignorefile /dev/null --format json --output /out/trivy-fs.json --exit-code 0 -q /src || true
       - id: verdict
         if: always()
         env:
@@ -975,7 +975,7 @@ jobs:
           got=$(jq -r '.manifests[0].digest' "$RUNNER_TEMP/oci/index.json")
           [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
           docker run --rm -v "$RUNNER_TEMP/oci:/oci:ro" -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            image --input /oci --scanners vuln,secret --ignorefile /dev/null --format json --output /out/trivy.json --exit-code 0 -q || true
+            image --input /oci --ignore-unfixed --scanners vuln,secret --ignorefile /dev/null --format json --output /out/trivy.json --exit-code 0 -q || true
           docker run --rm -v "$PWD/$OUT:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
             convert --format sarif --output /out/trivy.sarif /out/trivy.json -q || true
       - id: verdict

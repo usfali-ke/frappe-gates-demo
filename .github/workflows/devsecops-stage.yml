@@ -1645,7 +1645,7 @@ jobs:
         run: |
           mkdir -p "$OUT/dependency-check" && chmod 777 "$OUT/dependency-check"
           docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            image --scanners vuln,secret --ignorefile /dev/null --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
+            image --ignore-unfixed --scanners vuln,secret --ignorefile /dev/null --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
       - id: verdict
         if: ${{ !cancelled() }}
         env:

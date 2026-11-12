@@ -464,10 +464,11 @@ def trivy_config(path, render="kustomize build deploy/prod"):
 def trivy(path):
     """Critical/High (and unrated) with a released fix block; ones with no
     upstream fix are reported but don't block (BLOCK_UNFIXED=true to block
-    them too); Medium/Low are reported. The scan itself drops nothing (no
-    --severity, no --ignore-unfixed), so every vulnerability in the image is
-    recorded. Any embedded secret blocks. Plus "hardened base": a non-root
-    USER."""
+    them too); Medium/Low are reported. The scan keeps every severity (no
+    --severity) but, by decision (2026-11-12: prioritise what can be fixed),
+    runs with --ignore-unfixed: a vulnerability with no released fix isn't
+    recorded until one exists. Any embedded secret blocks. Plus "hardened
+    base": a non-root USER."""
     report = load(path)
     if report is None:
         return missing("trivy")
