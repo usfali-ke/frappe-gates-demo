@@ -1204,7 +1204,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live -m smoke against ${{ inputs.environment }} (read-only: no test users, no writes)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/smoke/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/smoke/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1257,7 +1257,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_integration.py against ${{ inputs.environment }} (TLS ingress, sessions, auth, API and pages on one database)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/integration/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/integration/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1310,7 +1310,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_e2e.py against ${{ inputs.environment }} (user journeys through the pages and their forms)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/e2e/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/e2e/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1363,7 +1363,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_regression.py against ${{ inputs.environment }} (fixed or decided behaviour that must not come back)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/regression/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/regression/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1416,7 +1416,7 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
           LABEL: "tests/live/test_security.py against ${{ inputs.environment }} (OWASP Top 10 with two users: IDOR, CSRF, sessions, headers, injection)"
           TOOL: pytest + requests
-        run: python3 .github/scripts/verdict.py tests "$OUT/security-tests/junit.xml"
+        run: uv run --no-project --with defusedxml==0.7.1 python .github/scripts/verdict.py tests "$OUT/security-tests/junit.xml"
       - name: Tear down
         if: always()
         run: bash tests/env/env-down.sh
@@ -1645,7 +1645,7 @@ jobs:
         run: |
           mkdir -p "$OUT/dependency-check" && chmod 777 "$OUT/dependency-check"
           docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$OUT/dependency-check:/out" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
-            image --scanners vuln --severity CRITICAL,HIGH --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
+            image --scanners vuln,secret --ignorefile /dev/null --format json --output /out/trivy.json --exit-code 0 -q "${IMAGE}@${DIGEST}" || true
       - id: verdict
         if: ${{ !cancelled() }}
         env:
