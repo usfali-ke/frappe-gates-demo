@@ -1,9 +1,15 @@
 # What the post-deploy test harness is allowed to do, and nothing else.
 #
 # tests/env/env-up.sh reaches the running environment from a self-hosted
-# runner: it lists pods to find the rollout's pod, forwards a local port to it
-# (TLS is terminated by Caddy in front of that port) and can exec into the pod
-# for the log assertions. That is the whole permission set.
+# runner: it lists pods to find the rollout's pod and forwards a local port to
+# it (TLS is terminated by Caddy in front of that port). That is the whole
+# permission set.
+#
+# No pods/exec (trivy KSV-0053, High: a shell in any pod of the namespace,
+# prod included). The test users the authenticated suites need are created
+# through the app itself instead: frappe_gates_demo.test_support.provision,
+# which only answers in dev and staging, where the pod has a
+# TEST_PROVISIONING_TOKEN, and only to a caller that presents it.
 #
 # Two subjects are bound because the environment runners are shared by the
 # product repos and each repo's installer mints its own service account token:
@@ -22,7 +28,7 @@ rules:
     resources: ["pods"]
     verbs: ["get", "list"]
   - apiGroups: [""]
-    resources: ["pods/portforward", "pods/exec"]
+    resources: ["pods/portforward"]
     verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

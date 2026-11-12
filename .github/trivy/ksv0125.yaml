@@ -1,0 +1,10 @@
+# trivy config (iac-trivy, and the release stage's config check): the
+# registries KSV-0125 ("Restrict container images to trusted registries")
+# accepts. trivy compares the registry DOMAIN only, so this trusts Docker Hub
+# and GHCR as hosts; which namespaces on them are allowed (docker.io/alienke,
+# ghcr.io/usfali-ke) is enforced at admission by Kyverno
+# (security-dashboard pipeline/k8s/kyverno/restrict-image-registries.yaml).
+ksv0125:
+  trusted_registries:
+    - docker.io
+    - ghcr.io

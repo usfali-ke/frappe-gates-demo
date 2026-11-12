@@ -19,7 +19,7 @@
 #             A vulnerable image therefore cannot be pushed and cannot reach
 #             a cluster, and a red Build makes the PR check red (merge).
 #             reproducible image (built twice) · SCA (trivy, lockfile) ·
-#             IaC (checkov) · the built image: trivy · syft SBOM · dockle
+#             IaC (trivy config) · the built image: trivy · syft SBOM · dockle
 #             (CIS) · django check --deploy; then, main only and only if
 #             every control passed: push the exact built digest to GHCR,
 #             cosign sign + SBOM/SLSA attestations
@@ -91,7 +91,6 @@ env:
   SEMGREP: semgrep/semgrep:1.177.0@sha256:acaac22ffc7b7cc5926de0751b223bce0b2491c33d18422fa72f632c78d81198
   GITLEAKS: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
   TRUFFLEHOG: trufflesecurity/trufflehog:3.97.9@sha256:52e67fef4d054ecff5c2ce4b4ae376626d1ef54aa0898b53cac19c25e92e14db
-  CHECKOV: bridgecrew/checkov:3.3.20@sha256:6d20ebbcde58b2dce6e3151a6771fefa4d468281fe442475455623f5799b9f53
   TRIVY: aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
   SYFT: anchore/syft:v1.52.0@sha256:500e2d872ac019436926e8322b4fc1f39441d94d21f6f4046c6ff29b30e8cb02
   DOCKLE: goodwithtech/dockle:v0.4.15@sha256:eade932f793742de0aa8755406c7677cd7696f8675b6180926f7eeffa7abe6b9
@@ -551,9 +550,9 @@ jobs:
             echo "Job summary generated at run-time"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ── IaC: checkov on the repo's own Dockerfile (the Dockerfile is in the
-  #    checkout, so this control runs on PR runs too, and the report is a
-  #    PR-required report).
+  # ── IaC: trivy config on the repo's own Dockerfile and rendered
+  #    manifests (iac-trivy, below). They are in the checkout, so this
+  #    control runs on PR runs too, and its report is a PR-required report.
 
   commits-signed:
     name: Develop · governance · signed commits
@@ -608,7 +607,7 @@ jobs:
 
   pr-static-gate:
     name: PR static gate
-    needs: [sast-semgrep, secrets-gitleaks, secrets-trufflehog, code-quality, unit-tests, sca-trivy, iac-checkov]
+    needs: [sast-semgrep, secrets-gitleaks, secrets-trufflehog, code-quality, unit-tests, sca-trivy, iac-trivy]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -822,11 +821,14 @@ jobs:
           path: reports/sca-trivy/
           if-no-files-found: ignore
 
-  iac-checkov:
-    name: Develop · IaC · checkov (Dockerfile + k8s render)
+  iac-trivy:
+    name: Develop · IaC · trivy config (Dockerfile + k8s render)
     # A static file scan: runs on every PR push, before review, as an input
-    # to the PR static gate (2026-11-10; it used to wait for G1 and ran only
-    # once G1 had passed, so a PR could pass G1 with a Critical dependency).
+    # to the PR static gate. trivy config replaced checkov (2026-11-12): its
+    # checks carry severities, so IaC blocks on Critical/High like every
+    # other scanner, and its findings can be accepted through the central
+    # risk register (open-source checkov has no severities, and its only
+    # waiver was an inline skip in this repo, approved by its own reviewers).
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -835,10 +837,10 @@ jobs:
     outputs:
       result: ${{ steps.verdict.outputs.result }}
     env:
-      CONTROL: iac-checkov
-      OUT: reports/iac-checkov
-      VERDICT_FILE: reports/iac-checkov/verdict.json
-      NATIVE: reports/iac-checkov/results_github_failed_only.md
+      CONTROL: iac-trivy
+      OUT: reports/iac-trivy
+      VERDICT_FILE: reports/iac-trivy/verdict.json
+      NATIVE: reports/iac-trivy/trivy-config.txt
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -853,35 +855,43 @@ jobs:
           set -uo pipefail
           mkdir -p "$OUT/input"
           cp Dockerfile "$OUT/input/Dockerfile"
-          # checkov skips CRDs, so the Rollout is scanned as the Deployment
-          # it is equivalent to (scan_view.py) — never applied.
-          # Prod's render: every overlay is deploy/base plus names and a digest.
+          # trivy's Kubernetes checks don't know Argo Rollouts, so the Rollout
+          # is scanned as the Deployment it is equivalent to (scan_view.py) —
+          # never applied. Prod's render: every overlay is deploy/base plus
+          # names and a digest.
           kubectl kustomize deploy/prod | uv run --no-project --with pyyaml==6.0.3 python .github/scripts/scan_view.py > "$OUT/input/prod.yaml" || exit 0
-          docker run --rm -v "$PWD/$OUT:/work" "$CHECKOV" -f /work/input/prod.yaml -f /work/input/Dockerfile \
-            --framework kubernetes dockerfile -o cli -o github_failed_only -o json --output-file-path /work --soft-fail --quiet > /dev/null || true
-          mv "$OUT/results_json.json" "$OUT/checkov.json" || true
-          cat "$OUT/results_cli.txt" 2>/dev/null || true
+          # Exceptions come from the central register only: an inline
+          # `trivy:ignore` (which trivy honours silently) would let a PR
+          # waive its own finding. Listed here; the verdict fails on any.
+          grep -rnE "trivy:ignore" Dockerfile deploy/ > "$OUT/inline-ignores.txt" || true
+          docker run --rm -v "$PWD/$OUT:/work" -v "$PWD/.github/trivy:/cfg:ro" -v trivy-cache:/root/.cache/trivy "$TRIVY" \
+            config --config-data /cfg --format json --output /work/trivy-config.json --exit-code 0 -q /work/input || true
       - id: verdict
         if: always()
         env:
-          TOOL: checkov 3.3.20
-        run: python3 .github/scripts/verdict.py checkov "$OUT/checkov.json"
-      # The tool's own report under the verdict (findings.py native).
+          TOOL: trivy 0.74.0 config
+          INLINE_IGNORES: reports/iac-trivy/inline-ignores.txt
+        run: python3 .github/scripts/verdict.py trivy-config "$OUT/trivy-config.json"
+      # trivy's table from the same JSON (no second scan), without what the
+      # register accepted.
       - name: tool report
         if: always()
-        run: python3 .github/scripts/findings.py native "$NATIVE"
+        run: |
+          docker run --rm -v "$PWD/$OUT:/out" "$TRIVY" convert --format table --ignorefile /out/accepted-ids.txt \
+            --output /out/trivy-config.txt /out/trivy-config.json -q || true
+          python3 .github/scripts/findings.py native "$NATIVE"
       # Code scanning, as in sast-semgrep.
-      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/iac-checkov/findings.sarif') != '' }}
+      - if: ${{ always() && !github.event.repository.private && hashFiles('reports/iac-trivy/findings.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         continue-on-error: true
         with:
-          sarif_file: reports/iac-checkov/findings.sarif
-          category: iac-checkov
+          sarif_file: reports/iac-trivy/findings.sarif
+          category: iac-trivy
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: report-iac-checkov
-          path: reports/iac-checkov/
+          name: report-iac-trivy
+          path: reports/iac-trivy/
           if-no-files-found: ignore
 
   image-scan:
@@ -1030,7 +1040,7 @@ jobs:
           [ "$got" = "$DIGEST" ] || { echo "::error::image artifact is $got, the build said $DIGEST"; exit 0; }
           # docker load only reads OCI layouts with the containerd image store
           skopeo copy --quiet "oci-archive:$RUNNER_TEMP/image/image.oci.tar" "docker-daemon:$IMAGE_TAG"
-          # Two documented exceptions, in the same spirit as the checkov skips:
+          # Two documented exceptions:
           # DKL-DI-0005 (apt caches) — the only layer that trips it is inherited
           # from python:3.11-slim (pinned by digest), which ends its apt install
           # with `apt-get dist-clean`; every apt layer this repo authors clears
@@ -1141,7 +1151,7 @@ jobs:
   publish:
     name: Build · push + sign + attest (only when every scan passed)
     needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog,
-            sca-trivy, iac-checkov, image-scan, sbom, image-compliance, frappe-migrate-check]
+            sca-trivy, iac-trivy, image-scan, sbom, image-compliance, frappe-migrate-check]
     if: ${{ !cancelled() && needs.build.outputs.digest != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1292,7 +1302,7 @@ jobs:
 
   gate-g2:
     name: G2 Control Gate (Build → Release)
-    needs: [gate-g1, build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
+    needs: [gate-g1, build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-trivy,
             image-scan, sbom, image-compliance, frappe-migrate-check, publish]
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -1339,7 +1349,7 @@ jobs:
 
   evidence:
     name: Release · evidence bundle
-    needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-checkov,
+    needs: [build, unit-tests, code-quality, sast-semgrep, secrets-gitleaks, secrets-trufflehog, sca-trivy, iac-trivy,
             reviewers, commits-signed, image-scan, sbom, image-compliance, frappe-migrate-check, publish,
             gate-g1, gate-g2]
     if: always()
@@ -1357,7 +1367,7 @@ jobs:
       # Controls that apply to this event; the rest aren't listed as missing.
       CONTROLS: >-
         build,unit-tests,coverage,code-quality,sast-semgrep,secrets-gitleaks,secrets-trufflehog,
-        sca-trivy,iac-checkov,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,' || '' }}image-scan,sbom,
+        sca-trivy,iac-trivy,${{ startsWith(github.event_name, 'pull_request') && 'reviewers,commits-signed,' || '' }}image-scan,sbom,
         image-compliance,frappe-migrate-check,publish
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
