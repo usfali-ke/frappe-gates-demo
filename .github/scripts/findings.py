@@ -66,11 +66,12 @@ KIND_OF_CONTROL = {
     "sast-semgrep": "sast", "secrets-gitleaks": "secrets", "secrets-trufflehog": "secrets",
     "sca-trivy": "sca", "iac-checkov": "iac", "config": "iac",
     "image-scan": "container", "image-compliance": "container",
+    "dependency-check": "container",  # the release stage's re-check of the deployed image
     "dast-nuclei": "dast", "dast-tls": "dast",
 }
 TOOL_OF_CONTROL = {
     "sast-semgrep": "semgrep", "secrets-gitleaks": "gitleaks", "secrets-trufflehog": "trufflehog",
-    "sca-trivy": "trivy", "iac-checkov": "checkov", "config": "checkov", "image-scan": "trivy",
+    "sca-trivy": "trivy", "iac-checkov": "checkov", "config": "checkov", "image-scan": "trivy", "dependency-check": "trivy",
     "image-compliance": "dockle", "dast-nuclei": "nuclei", "dast-tls": "testssl",
 }
 DD_SEVERITY = {"critical": "Critical", "high": "High", "unknown": "High", "medium": "Medium", "low": "Low", "info": "Info"}
